@@ -18,3 +18,13 @@ typedef struct LinearCalibration {
 } LinearCalibration;
 
 float linearApply(const LinearCalibration* c, float x);
+
+// Two-point fit through (x1, y1) and (x2, y2), e.g. module mV read in two pH
+// buffers. false (and *out left invalid) if the x values are too close.
+bool linearFromTwoPoints(float x1, float y1, float x2, float y2, uint16_t revision,
+                         LinearCalibration* out);
+
+// Sort `samples` in place, drop `trim` values at each end and return the mean
+// of the rest (spike-rejecting filter, pH-4502C tutorial: 10 samples, mean of
+// the middle 6). Returns 0 if n <= 2 * trim.
+float trimmedMeanU32(uint32_t* samples, uint8_t n, uint8_t trim);

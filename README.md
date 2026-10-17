@@ -3,9 +3,10 @@
 > **Target change (October 2026):** the board is now an ESP32-S3-WROOM-1 N16R8
 > (16 MB flash, 8 MB octal PSRAM). This supersedes architecture decision **D02**
 > ("WROOM-32D remains target"). `platformio.ini` uses `esp32-s3-devkitc-1`, and the env
-> names are unchanged. Only the BME280 I2C pins have been remapped so far
-> (SDA 21, SCL 47; the S3 has no GPIO22). The HC-SR04 (26/27) and ADC (32-35)
-> pins in `board_profile.h` are **invalid on the S3** and must be remapped before
+> names are unchanged. Remapped so far: BME280 I2C (SDA 21, SCL 47; the S3 has
+> no GPIO22) and pH-4502C (GPIO7 / ADC1_CH6, per `Pin Layout.drawio` of 16 Oct).
+> The HC-SR04 (26/27) and light/TDS/MQ-7 ADC (32, 33, 35) pins in
+> `board_profile.h` are still **invalid on the S3** and must be remapped before
 > WP2-WP6 (the S3's ADC1 is on GPIO1-10, and GPIO33-37 are taken by the PSRAM).
 
 New layered FreeRTOS firmware. The design authority is
@@ -111,7 +112,7 @@ To change one, open a short review with the team lead. Do not edit them inside a
 | WP2 | DS18B20 + 1-Wire HAL | `drivers/ds18b20.*`, `hal/onewire_bus.*` | 2 | — |
 | WP3 | DFR0026 light + ADC HAL | `drivers/light.*`, `hal/adc_channel.*` | 2 | — |
 | WP4 | HC-SR04 + pulse capture (RMT) | `drivers/hcsr04.*`, `hal/pulse_capture.*` | 3 | ECHO divider verified |
-| WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*` | 3 | WP3 ADC HAL; pH ADC headroom (§3) |
+| WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration") |
 | WP6 | MQ-7 heater/conditioning | `drivers/mq7.*` | 3 | module identity, heater access |
 | WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*` | 4 | ≥1 working driver; thresholds |
 | WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*` | 5 | WP7 snapshot |
@@ -128,7 +129,7 @@ The following are still `BOARD_PIN_UNASSIGNED` or unknown. Do not guess them in 
 - 5 V rail feedback
 - Relay GPIO, polarity, NO/NC contacts and the load-safe state. The relay part label also needs resolving (IRLZ440N vs IRF4905).
 - MQ-7 heater control
-- pH and light ADC headroom
+- Light ADC headroom, and the pH range measured on the board (nominally 3.0 V max at the pin)
 - All trip and clear thresholds
 
 ## Build and test
@@ -159,6 +160,49 @@ If the first build fails:
 
 - **`build_src_filter` rejects `../test/bringup/...`:** move the bring-up mains to `src/bringup/`, point the filters there, and add `-<bringup/>` to the `esp32dev` and `native` filters.
 - **Toolchain or path errors:** the project path contains spaces. Try setting `PLATFORMIO_CORE_DIR` to a path without spaces. This is something to check, not a confirmed problem.
+
+## pH-4502C calibration (WP5)
+
+Wiring: PO -> 10 kOhm -> GPIO7 (ADC1_CH6), 15 kOhm and 1 uF to GND. DO and TO
+are not connected. A 5 V module output is 3.0 V at the pin, inside the S3's
+~3.1 V range at 11 dB (the ~2.45 V limit in §3 is for the original ESP32).
+
+The driver averages a spaced window: 10 conversions 30 ms apart, sorted, mean of
+the middle 6 (the tutorial's filter). Until two buffer points are entered it
+publishes the module voltage in mV with `HEALTH_UNCALIBRATED` (D13). The
+bring-up harness prints those values with `(uncal)`.
+
+```bash
+pio run -e test_ph -t upload -t monitor
+```
+
+1. **Offset (once per module).** Unplug the probe and short the BNC centre to
+   its shell. Turn the pot nearest the BNC until the line reads about
+   `2500 mV (uncal)`, which is pH 7. A factory-set module puts pH 7 near 0 V,
+   so it first prints `ph=UNPOWERED` (PO below about 170 mV). Check that the
+   5 V rail is on, then keep turning the pot until mV values appear.
+2. **Buffers.** Plug the probe in. Rinse it, put it in the pH 6.86 buffer, wait
+   at least 2 minutes and note the mV. Rinse it again, then do the same with
+   pH 4.01. Never move the probe between solutions without rinsing.
+3. **Fit.** Enter both mV values as `PH_BUFFER_A_MV` and `PH_BUFFER_B_MV` in
+   `test/bringup/ph_main.c` and flash it again. The slope is printed at boot.
+   The tutorial's nominal slope is about -0.0057 pH/mV. Readings then show
+   `pH` with health OK.
+4. **Check.** Measure a third buffer (for example 9.18) that was not used for
+   the fit, and record the error and the noise. Recalibrate from time to time,
+   because probes drift.
+
+**Without buffers (nominal pH).** While both buffer values are 0, `ph_main.c`
+uses a nominal fit and prints pH with `(uncal)`. pH 7 is the module voltage
+measured with the BNC shorted (`PH_NOMINAL_MV_AT_PH7`, 2758 mV on 17 Oct 2026),
+and the slope is the tutorial's -0.0057 pH/mV. Expect roughly +/-0.5-1 pH, and
+measure the shorted value again whenever the offset pot is turned. The driver
+reports these readings as `HEALTH_UNCALIBRATED` (`calibrationProvisional`), so
+they never count as actionable. Bring-up tests on 17 Oct gave tap water 6.9,
+vinegar 3.6 and baking soda 7.8.
+
+Production code does not store the calibration yet. Keeping the fit in NVS is
+WP8 (`services/configuration`).
 
 ## Stage 1 build record (4 October 2026)
 

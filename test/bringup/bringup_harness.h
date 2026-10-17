@@ -23,7 +23,9 @@ typedef struct BringupContext {
 
 // One compact line per measurement, e.g.
 //   [bme280] 27.98 degC | 54.20 %RH | 101602.04 Pa   (11 ms)
-// A reading that is not OK shows its metric and health instead of a value.
+// An UNCALIBRATED reading shows its raw-unit value with "(uncal)", e.g.
+//   [ph4502c] 2498.31 mV (uncal)   (271 ms)
+// Any other non-OK reading shows its metric and health instead of a value.
 static inline void bringupPrintResult(const char* name, const Reading* r, uint8_t n,
                                       uint32_t elapsedMs) {
   printf("[%s] ", name);
@@ -31,8 +33,11 @@ static inline void bringupPrintResult(const char* name, const Reading* r, uint8_
     if (i > 0) printf(" | ");
     if (r[i].health == HEALTH_OK) {
       printf("%.2f %s", (double)r[i].value, unitName(r[i].unit));
+    } else if (r[i].health == HEALTH_UNCALIBRATED) {
+      printf("%.2f %s (uncal)", (double)r[i].value, unitName(r[i].unit));
     } else {
       printf("%s=%s", metricName(r[i].metric), healthName(r[i].health));
+      if (r[i].hasRaw) printf(" (raw %ld)", (long)r[i].raw);
     }
   }
   printf("   (%lu ms)\n", (unsigned long)elapsedMs);

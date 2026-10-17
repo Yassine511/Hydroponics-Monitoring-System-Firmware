@@ -44,6 +44,26 @@ static void test_divider_recovery_uses_nominal_ratios(void) {
                                             BOARD_PH_DIVIDER_BOTTOM_OHM));
 }
 
+static void test_two_point_fit_maps_buffers(void) {
+  // Module mV in pH 6.86 and 4.01 buffers, about -5.7 pH/V (tutorial).
+  LinearCalibration c;
+  TEST_ASSERT_TRUE(linearFromTwoPoints(2500.0f, 6.86f, 3000.0f, 4.01f, 1, &c));
+  TEST_ASSERT_TRUE(c.valid);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, -0.0057f, c.slope);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 6.86f, linearApply(&c, 2500.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 4.01f, linearApply(&c, 3000.0f));
+  TEST_ASSERT_FALSE(linearFromTwoPoints(2500.0f, 6.86f, 2500.0f, 4.01f, 2, &c));
+  TEST_ASSERT_FALSE(c.valid);
+}
+
+static void test_trimmed_mean_rejects_spikes(void) {
+  uint32_t s[10] = {1500, 4000, 1502, 1498, 0, 1501, 1499, 1500, 3100, 1500};
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 1500.333f, trimmedMeanU32(s, 10, 2));  // 1499..1502
+  TEST_ASSERT_TRUE(s[0] == 0 && s[9] == 4000);  // sorted in place
+  uint32_t few[4] = {1, 2, 3, 4};
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, trimmedMeanU32(few, 4, 2));
+}
+
 static void test_snapshot_reset_indexes_by_metric(void) {
   Snapshot s;
   snapshotReset(&s);
@@ -66,6 +86,8 @@ int main(int argc, char** argv) {
   RUN_TEST(test_ok_reading_becomes_stale_after_limit);
   RUN_TEST(test_fault_is_not_masked_by_staleness);
   RUN_TEST(test_divider_recovery_uses_nominal_ratios);
+  RUN_TEST(test_two_point_fit_maps_buffers);
+  RUN_TEST(test_trimmed_mean_rejects_spikes);
   RUN_TEST(test_snapshot_reset_indexes_by_metric);
   RUN_TEST(test_production_ready_requires_power_sense);
   return UNITY_END();

@@ -32,7 +32,8 @@ enum {
 
 // TODO(S3): the pins below are still the WROOM-32D mapping and are INVALID on
 // the S3 (GPIO26-32 = flash/PSRAM, GPIO33-37 = octal PSRAM on R8, ADC1 is
-// GPIO1-10). Remap before WP2-WP6. GPIO4 (1-Wire) remains valid.
+// GPIO1-10). Remap before WP2-WP6. GPIO4 (1-Wire) remains valid. The pH pin
+// has been remapped (see below).
 
 // ---- DS18B20 (3.3 V, 1-Wire, external supply, 4.7 kOhm pull-up) -------------
 #define BOARD_PIN_ONE_WIRE ((int8_t)4)
@@ -44,7 +45,9 @@ enum {
 #define BOARD_PIN_TDS_ADC ((int8_t)33)
 
 // ---- pH-4502C (switched 5 V, ADC1_CH6, divider 10k top / 15k bottom) --------
-#define BOARD_PIN_PH_ADC ((int8_t)34)
+// S3 remap (WP5, Oct 2026): PO -> 10k/15k -> GPIO7 (ADC1_CH6) + 1 uF to GND,
+// as wired and drawn in Pin Layout.drawio (16 Oct 2026). Was GPIO34 on the D.
+#define BOARD_PIN_PH_ADC ((int8_t)7)
 #define BOARD_PH_DIVIDER_TOP_OHM ((uint32_t)10000)
 #define BOARD_PH_DIVIDER_BOTTOM_OHM ((uint32_t)15000)
 
