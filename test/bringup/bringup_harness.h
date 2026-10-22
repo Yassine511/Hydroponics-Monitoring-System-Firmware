@@ -19,6 +19,9 @@
 typedef struct BringupContext {
   SensorDriver* driver;
   uint32_t periodMs;
+  // Optional, called from the harness task after every READY result (so it
+  // may use driver getters without breaking single bus ownership). NULL = none.
+  void (*afterResult)(SensorDriver* driver);
 } BringupContext;
 
 // One compact line per measurement, e.g.
@@ -95,6 +98,7 @@ static inline void bringupTask(void* arg) {
     Reading out[4];
     const uint8_t n = sensorDriverReadResult(drv, out, 4);
     bringupPrintResult(sensorDriverName(drv), out, n, elapsedMs);
+    if (ctx->afterResult != NULL) ctx->afterResult(drv);
   }
 }
 

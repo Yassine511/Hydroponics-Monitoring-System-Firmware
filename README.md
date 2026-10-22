@@ -35,8 +35,8 @@ editable source is [`docs/architecture/`](docs/architecture/); rebuild with
 refer to Rev 3. The old team code is kept unchanged and is used only as reference.
 
 **Status: Stage 1 skeleton plus first drivers.** The shared contracts are in
-place and every module exists and compiles. The BME280 (WP1) and pH (WP5)
-drivers are written; the others are still stubs (see "Work packages").
+place and every module exists and compiles. The BME280 (WP1), pH (WP5) and SGP30
+(WP6) drivers are written; the others are still stubs (see "Work packages").
 
 ## Language: C (migrated from C++, October 2026)
 
@@ -130,7 +130,7 @@ To change one, open a short review with the team lead. Do not edit them inside a
 | WP3 | DFR0026 light + ADC HAL | `drivers/light.*`, `hal/adc_channel.*` | 2 | — |
 | WP4 | HC-SR04 + pulse capture (RMT) | `drivers/hcsr04.*`, `hal/pulse_capture.*` | 3 | ECHO divider verified |
 | WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration") |
-| WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `test/bringup/sgp30_main.c` | 2 | raw 16-bit command write/read in the I2C HAL |
+| WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `domain/sgp30_codec.*`, `hal/i2c_bus.*` (raw write/read), `test/bringup/sgp30_main.c`, `test/bringup/climate_main.c` | 2 | — (**running on S3 hardware 22 Oct 2026: feature set 0x0020 @0x58, 1 s cadence, 13 ms per measurement, no CRC faults; breath and hand-sanitiser spikes seen. Runs with the BME280 on the shared bus in `test_climate`, with humidity compensation. Baseline save/restore, 12 h learning and fault recovery not yet tested**; baseline is RAM-only until WP8 stores it in NVS) |
 | WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*` | 4 | ≥1 working driver; thresholds |
 | WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*` | 5 | WP7 snapshot |
 | WP9 | Power ISR, rail epoch, lease handover | `services/power_coordinator.*`, `services/rail_state.*` | 6 | power sense on GPIO8 measured on the board |

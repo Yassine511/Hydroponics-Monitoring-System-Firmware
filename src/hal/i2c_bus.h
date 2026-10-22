@@ -4,7 +4,7 @@
 // limited stuck-bus recovery (§16), never a blocking retry loop.
 //
 // Worst-case blocking: I2C_BUS_TIMEOUT_MS per transaction (probe/writeReg/
-// readRegs); recover() ~0.2 ms of bit-banging plus one begin().
+// readRegs/write/read); recover() ~0.2 ms of bit-banging plus one begin().
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -26,5 +26,10 @@ bool i2cBusBegin(I2cBus* bus, int8_t sda, int8_t scl, uint32_t clockHz);
 bool i2cBusProbe(I2cBus* bus, uint8_t address);
 bool i2cBusWriteReg(I2cBus* bus, uint8_t address, uint8_t reg, uint8_t value);
 bool i2cBusReadRegs(I2cBus* bus, uint8_t address, uint8_t reg, uint8_t* buf, size_t len);
+// Raw transfers for command-based devices (SGP30): each is one transaction
+// ending in STOP, so a device that NACKs while busy is never held by a
+// repeated start. A read returns true only if all `len` bytes arrived.
+bool i2cBusWrite(I2cBus* bus, uint8_t address, const uint8_t* tx, size_t len);
+bool i2cBusRead(I2cBus* bus, uint8_t address, uint8_t* buf, size_t len);
 bool i2cBusRecover(I2cBus* bus);
 void i2cBusEnd(I2cBus* bus);

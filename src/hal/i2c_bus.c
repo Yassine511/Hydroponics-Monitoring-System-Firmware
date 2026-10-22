@@ -38,6 +38,18 @@ bool i2cBusReadRegs(I2cBus* bus, uint8_t address, uint8_t reg, uint8_t* buf, siz
   return got == len;  // a partial or failed read is dropped
 }
 
+bool i2cBusWrite(I2cBus* bus, uint8_t address, const uint8_t* tx, size_t len) {
+  if (!bus->started_ || tx == NULL || len == 0) return false;
+  return i2cWrite(kI2cPort, address, tx, len, I2C_BUS_TIMEOUT_MS) == ESP_OK;
+}
+
+bool i2cBusRead(I2cBus* bus, uint8_t address, uint8_t* buf, size_t len) {
+  if (!bus->started_ || buf == NULL || len == 0) return false;
+  size_t got = 0;
+  i2cRead(kI2cPort, address, buf, len, I2C_BUS_TIMEOUT_MS, &got);
+  return got == len;  // a partial or failed read is dropped
+}
+
 // Release a slave holding SDA low: up to 9 SCL pulses, then a STOP.
 // Bounded (~0.2 ms); no retry loop.
 bool i2cBusRecover(I2cBus* bus) {

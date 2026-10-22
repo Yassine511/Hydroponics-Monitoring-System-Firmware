@@ -5,6 +5,7 @@
 #include "board_profile.h"
 #include "domain/calibration.h"
 #include "domain/reading.h"
+#include "domain/sgp30_codec.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -90,6 +91,36 @@ static void test_production_ready_requires_power_sense(void) {
   if (!v.powerSenseAssigned || !BOARD_POWER_SENSE_VERIFIED) TEST_ASSERT_FALSE(v.productionReady);
 }
 
+static void test_sgp30_crc_matches_datasheet_vector(void) {
+  const uint8_t beef[2] = {0xBE, 0xEF};
+  TEST_ASSERT_EQUAL_HEX8(0x92, sgp30Crc8(beef, 2));
+}
+
+static void test_sgp30_words_round_trip_and_reject_bad_crc(void) {
+  uint8_t buf[6];
+  sgp30PackWord(0x01A3, &buf[0]);  // CO2eq 419 ppm
+  sgp30PackWord(0x0007, &buf[3]);  // TVOC 7 ppb
+  uint16_t w[2] = {0, 0};
+  TEST_ASSERT_TRUE(sgp30UnpackWords(buf, 2, w));
+  TEST_ASSERT_EQUAL_HEX16(0x01A3, w[0]);
+  TEST_ASSERT_EQUAL_HEX16(0x0007, w[1]);
+  buf[4] ^= 0x01;  // one flipped bit in the second word
+  TEST_ASSERT_FALSE(sgp30UnpackWords(buf, 2, w));
+  const uint8_t floating[3] = {0xFF, 0xFF, 0xFF};  // released bus
+  TEST_ASSERT_FALSE(sgp30UnpackWords(floating, 1, w));
+}
+
+static void test_sgp30_humidity_fixed_point(void) {
+  TEST_ASSERT_EQUAL_HEX16(0x0F80, sgp30GramsToFixed8p8(15.5f));  // datasheet example
+  TEST_ASSERT_EQUAL_HEX16(0x0000, sgp30GramsToFixed8p8(0.0f));
+  TEST_ASSERT_EQUAL_HEX16(0x0001, sgp30GramsToFixed8p8(0.001f));
+  TEST_ASSERT_EQUAL_HEX16(0xFFFF, sgp30GramsToFixed8p8(300.0f));
+  // The datasheet formula gives 11.48 g/m3 at 25 degC / 50 %RH (its text rounds
+  // this example to 11.8).
+  TEST_ASSERT_FLOAT_WITHIN(0.02f, 11.48f, sgp30AbsoluteHumidity(25.0f, 50.0f));
+  TEST_ASSERT_TRUE(sgp30AbsoluteHumidity(25.0f, 120.0f) < 0.0f);
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -103,5 +134,8 @@ int main(int argc, char** argv) {
   RUN_TEST(test_trimmed_mean_rejects_spikes);
   RUN_TEST(test_snapshot_reset_indexes_by_metric);
   RUN_TEST(test_production_ready_requires_power_sense);
+  RUN_TEST(test_sgp30_crc_matches_datasheet_vector);
+  RUN_TEST(test_sgp30_words_round_trip_and_reject_bad_crc);
+  RUN_TEST(test_sgp30_humidity_fixed_point);
   return UNITY_END();
 }
