@@ -28,6 +28,10 @@ Health readingHealthAt(const Reading* r, MonoMs now, uint32_t staleLimitMs) {
   return HEALTH_OK;
 }
 
+bool readingIsActionableAt(const Reading* r, MonoMs now, uint32_t staleLimitMs) {
+  return readingHealthAt(r, now, staleLimitMs) == HEALTH_OK;
+}
+
 const char* healthName(Health h) {
   switch (h) {
     case HEALTH_STARTING: return "STARTING";

@@ -24,12 +24,13 @@ static DriverStatus phInit(SensorDriver* d) {
   return DRIVER_OK;
 }
 
-// Take one sample of the window. false on an ADC error.
-static bool sample(PhDriver* self) {
+// Take one sample of the window at `now`. false on an ADC error.
+static bool sample(PhDriver* self, MonoMs now) {
   uint32_t mv = 0;
   bool saturated = false;
   if (!adcChannelReadMilliVolts(self->config_.adc, &mv, &saturated)) return false;
   self->samples_[self->count_++] = mv;
+  self->lastSampleMs_ = now;
   self->saturated_ = self->saturated_ || saturated;
   return true;
 }
@@ -40,7 +41,7 @@ static DriverStatus phStart(SensorDriver* d, MonoMs now) {
   self->count_ = 0;
   self->saturated_ = false;
   self->startMs_ = now;
-  if (!sample(self)) {
+  if (!sample(self, now)) {
     self->initialised_ = false;
     return DRIVER_FAULT;
   }
@@ -53,13 +54,15 @@ static PollResult phPoll(SensorDriver* d, MonoMs now) {
   PollResult r = {DRIVER_FAULT, now};
   if (!self->busy_) return r;
 
-  const MonoMs due = self->startMs_ + (MonoMs)self->count_ * PH_SAMPLE_SPACING_MS;
+  // Spacing is measured from the previous actual sample, never from the window
+  // start: after a late poll, catching up would compress the filter taps.
+  const MonoMs due = self->lastSampleMs_ + PH_SAMPLE_SPACING_MS;
   if (now < due) {
     r.status = DRIVER_PENDING;
     r.nextPollMs = due;
     return r;
   }
-  if (!sample(self)) {
+  if (!sample(self, now)) {
     self->busy_ = false;
     self->initialised_ = false;
     self->result_.health = HEALTH_FAULT;
@@ -69,7 +72,7 @@ static PollResult phPoll(SensorDriver* d, MonoMs now) {
   }
   if (self->count_ < PH_SAMPLES) {
     r.status = DRIVER_PENDING;
-    r.nextPollMs = self->startMs_ + (MonoMs)self->count_ * PH_SAMPLE_SPACING_MS;
+    r.nextPollMs = self->lastSampleMs_ + PH_SAMPLE_SPACING_MS;
     return r;
   }
   return finish(self, now);
@@ -160,6 +163,7 @@ void phDriverConstruct(PhDriver* self, const PhConfig* config) {
   self->saturated_ = false;
   self->count_ = 0;
   self->startMs_ = 0;
+  self->lastSampleMs_ = 0;
   readingReset(&self->result_, SENSOR_PH, METRIC_PH, UNIT_PH);
   self->result_.calibrationRevision = config->calibration.revision;
 }

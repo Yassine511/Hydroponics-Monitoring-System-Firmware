@@ -268,14 +268,15 @@ static uint32_t compensateP(Bme280Driver* self, int32_t adcP) {
   p = (((p << 31) - var2) * 3125) / var1;
   var1 = ((int64_t)c->p9 * (p >> 13) * (p >> 13)) >> 25;
   var2 = ((int64_t)c->p8 * p) >> 19;
-  p = ((p + var1 + var2) >> 8) + ((int64_t)c->p7 << 4);
+  p = ((p + var1 + var2) >> 8) + ((int64_t)c->p7 * 16);  // << 4; p7 is signed
   return (uint32_t)p;
 }
 
 static uint32_t compensateH(Bme280Driver* self, int32_t adcH) {
   const Bme280Calib* c = &self->calib_;
   int32_t v = self->tFine_ - 76800;
-  v = (((((adcH << 14) - ((int32_t)c->h4 << 20) -
+  // h4 is signed: multiply, not << 20 (a negative left shift is undefined in C).
+  v = (((((adcH << 14) - ((int32_t)c->h4 * 1048576) -
           ((int32_t)c->h5 * v)) + 16384) >> 15) *
        (((((((v * (int32_t)c->h6) >> 10) *
             (((v * (int32_t)c->h3) >> 11) + 32768)) >> 10) + 2097152) *

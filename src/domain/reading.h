@@ -59,8 +59,13 @@ typedef struct Snapshot {
 // Initialise a record to STARTING with identity fields set.
 void readingReset(Reading* r, SensorId sensor, MetricId metric, Unit unit);
 
-// True only for fresh, valid, calibrated data (eligible for numeric rules).
+// True if the stored health is OK. Does NOT check age: a consumer that acts on
+// the value (Safety, control rules) must use readingIsActionableAt() instead.
 bool readingIsActionable(const Reading* r);
+
+// True only for fresh, valid, calibrated data (eligible for numeric rules):
+// stored health OK and not older than staleLimitMs at `now` (§10).
+bool readingIsActionableAt(const Reading* r, MonoMs now, uint32_t staleLimitMs);
 
 // Returns Stale if an Ok reading is older than staleLimitMs at `now`,
 // otherwise the reading's current health.

@@ -9,7 +9,9 @@
 //
 // Filter (tutorial sketch): PH_SAMPLES conversions spaced PH_SAMPLE_SPACING_MS
 // apart, sorted, mean of the middle PH_SAMPLES - 2*PH_TRIM. The window is spread
-// over successive poll() calls, never taken as a burst (§7).
+// over successive poll() calls, never taken as a burst (§9): each tap is due
+// PH_SAMPLE_SPACING_MS after the previous actual sample, so a late poll delays
+// the rest of the window instead of compressing it.
 // No temperature compensation: the tutorial reports < 0.01 pH below 30 degC.
 //
 // Results:
@@ -28,7 +30,7 @@
 // Worst-case blocking (one ADC conversion C, well under 1 ms):
 //   init()    1 C   (throwaway conversion, checks the channel)
 //   start()   1 C   (first sample of the window)
-//   poll()    1 C   Pending until the window is full (~270 ms)
+//   poll()    1 C   Pending until the window is full (>= 270 ms)
 //   others    none
 //
 // Implements the SensorDriver contract in drivers/sensor_driver.h.
@@ -62,6 +64,7 @@ typedef struct PhDriver {
   uint8_t count_;
   uint32_t samples_[PH_SAMPLES];  // pin mV
   MonoMs startMs_;
+  MonoMs lastSampleMs_;  // next tap is due PH_SAMPLE_SPACING_MS after this
   Reading result_;
 } PhDriver;
 

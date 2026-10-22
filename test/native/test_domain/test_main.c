@@ -26,6 +26,18 @@ static void test_ok_reading_becomes_stale_after_limit(void) {
   TEST_ASSERT_TRUE(readingHealthAt(&r, 2001, 1000) == HEALTH_STALE);
 }
 
+static void test_stale_reading_is_not_actionable(void) {
+  Reading r;
+  readingReset(&r, SENSOR_PH, METRIC_PH, UNIT_PH);
+  r.health = HEALTH_OK;
+  r.intervalEndMs = 1000;
+  TEST_ASSERT_TRUE(readingIsActionableAt(&r, 4000, 3000));   // exactly at the limit
+  TEST_ASSERT_FALSE(readingIsActionableAt(&r, 4001, 3000));  // stale
+  TEST_ASSERT_TRUE(readingIsActionable(&r));                 // health-only check is unchanged
+  r.health = HEALTH_UNCALIBRATED;
+  TEST_ASSERT_FALSE(readingIsActionableAt(&r, 1000, 3000));  // fresh but not OK
+}
+
 static void test_fault_is_not_masked_by_staleness(void) {
   Reading r;
   readingReset(&r, SENSOR_PH, METRIC_PH, UNIT_PH);
@@ -84,6 +96,7 @@ int main(int argc, char** argv) {
   UNITY_BEGIN();
   RUN_TEST(test_reset_reading_is_starting_and_not_actionable);
   RUN_TEST(test_ok_reading_becomes_stale_after_limit);
+  RUN_TEST(test_stale_reading_is_not_actionable);
   RUN_TEST(test_fault_is_not_masked_by_staleness);
   RUN_TEST(test_divider_recovery_uses_nominal_ratios);
   RUN_TEST(test_two_point_fit_maps_buffers);
