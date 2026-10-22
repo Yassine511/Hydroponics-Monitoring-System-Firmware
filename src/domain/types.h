@@ -21,7 +21,7 @@ enum {
   SENSOR_HCSR04,
   SENSOR_PH,      // pH-4502C
   SENSOR_TDS,     // SEN0244
-  SENSOR_MQ7,
+  SENSOR_SGP30,   // TVOC / CO2eq (replaced the MQ-7, D18)
   SENSOR_COUNT
 };
 
@@ -36,7 +36,8 @@ enum {
   METRIC_WATER_DISTANCE,       // HC-SR04
   METRIC_PH,                   // pH-4502C
   METRIC_TDS,                  // SEN0244
-  METRIC_CO_SIGNAL,            // MQ-7 (raw until qualified)
+  METRIC_TVOC,                 // SGP30, ppb
+  METRIC_CO2EQ,                // SGP30, ppm (estimate, not measured CO2)
   METRIC_COUNT
 };
 
@@ -50,5 +51,6 @@ enum {
   UNIT_MILLIMETRE,
   UNIT_PH,
   UNIT_PPM,
-  UNIT_ADC_RAW
+  UNIT_ADC_RAW,
+  UNIT_PPB
 };

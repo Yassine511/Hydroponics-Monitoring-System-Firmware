@@ -1,4 +1,4 @@
-// ADC1 channel adapter (HAL). Work package WP3 (shared by light, pH, TDS, MQ-7).
+// ADC1 channel adapter (HAL). Work package WP3 (shared by light, pH and TDS).
 // ADC1 only: ADC2 conflicts with Wi-Fi (§3). Returns calibrated millivolts at
 // the ESP32 pin; divider recovery and units belong to domain/calibration.h.
 //

@@ -1,5 +1,5 @@
 // Unit conversion and calibration stages (§3, §14). Pure C.
-// Work packages: WP5 (pH/TDS), WP6 (MQ-7), WP3 (light).
+// Work packages: WP5 (pH/TDS), WP3 (light).
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>

@@ -5,7 +5,8 @@
 // The records must keep the layout they had in C++ (enum class : uint8_t):
 // they are copied through queues and sized into RAM budgets.
 _Static_assert(sizeof(Reading) == 56, "Reading layout changed");
-_Static_assert(sizeof(Snapshot) == 528, "Snapshot layout changed");
+// 528 -> 584 bytes on 22 Oct 2026: MQ-7 CO signal replaced by SGP30 TVOC + CO2eq.
+_Static_assert(sizeof(Snapshot) == 584, "Snapshot layout changed");
 
 void readingReset(Reading* r, SensorId sensor, MetricId metric, Unit unit) {
   memset(r, 0, sizeof(*r));
@@ -52,7 +53,8 @@ const char* metricName(MetricId m) {
     case METRIC_WATER_DISTANCE: return "water_distance";
     case METRIC_PH: return "ph";
     case METRIC_TDS: return "tds";
-    case METRIC_CO_SIGNAL: return "co_signal";
+    case METRIC_TVOC: return "tvoc";
+    case METRIC_CO2EQ: return "co2eq";
     case METRIC_COUNT: break;
   }
   return "?";
@@ -69,6 +71,7 @@ const char* unitName(Unit u) {
     case UNIT_PH: return "pH";
     case UNIT_PPM: return "ppm";
     case UNIT_ADC_RAW: return "raw";
+    case UNIT_PPB: return "ppb";
   }
   return "?";
 }

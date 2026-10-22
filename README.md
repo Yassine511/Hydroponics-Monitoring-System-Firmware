@@ -1,23 +1,42 @@
 # Hydroponics firmware (ESP32-S3-WROOM-1 N16R8)
 
-> **Target change (October 2026):** the board is now an ESP32-S3-WROOM-1 N16R8
-> (16 MB flash, 8 MB octal PSRAM). This supersedes architecture decision **D02**
-> ("WROOM-32D remains target"). `platformio.ini` uses `esp32-s3-devkitc-1`, and the env
-> names are unchanged. Remapped so far: BME280 I2C (SDA 21, SCL 47; the S3 has
-> no GPIO22) and pH-4502C (GPIO7 / ADC1_CH6, per `Pin Layout.drawio` of 16 Oct).
-> The HC-SR04 (26/27) and light/TDS/MQ-7 ADC (32, 33, 35) pins in
-> `board_profile.h` are still **invalid on the S3** and must be remapped before
-> WP2-WP6 (the S3's ADC1 is on GPIO1-10, and GPIO33-37 are taken by the PSRAM).
+> **Target (October 2026):** ESP32-S3-WROOM-1 N16R8 (16 MB flash, 8 MB octal
+> PSRAM), decision **D16** (supersedes D02). `platformio.ini` uses
+> `esp32-s3-devkitc-1`, and the env names are unchanged. The MQ-7 has been removed
+> from the hardware and replaced by an **SGP30** on the retained 3.3 V supply (D18).
+
+## Pin map (Pin Layout, 22 Oct 2026; architecture §5)
+
+| Signal | GPIO | Notes |
+|--------|------|-------|
+| I2C SDA / SCL (BME280 0x76, SGP30 0x58) | 21 / 47 | 4.7 kOhm pull-ups to 3.3 V |
+| DS18B20 DQ | 14 | 4.7 kOhm pull-up, external 3.3 V supply |
+| DFR0026 light | 1 (ADC1_CH0) | 10 kOhm series, 1 uF to GND |
+| SEN0244 TDS | 6 (ADC1_CH5) | 100 nF to GND, filtered external 5 V |
+| pH-4502C PO | 7 (ADC1_CH6) | 10 kOhm / 15 kOhm divider, 1 uF; DO/TO not connected |
+| HC-SR04 TRIG / ECHO | 17 / 18 | ECHO through 1 kOhm / 2 kOhm divider |
+| External-power sense | 8 (ADC1_CH7) | 220 Ohm over 2 x 220 Ohm from external 5 V (~3.33 V) |
+| Relay drive | 15 | IRLZ44N low side, 220 Ohm gate, 10 kOhm pull-down; active-high |
+| Native USB D- / D+ | 19 / 20 | 22 Ohm series |
+
+GPIO35-37 are used by the PSRAM; GPIO0, 3, 45 and 46 are strapping pins.
+
+> `include/board_profile.h` matches this table (remapped 22 Oct 2026).
+> `BOARD_POWER_SENSE_VERIFIED` stays `false`, so the build reports non-production
+> until GPIO8 is measured on the board. The MQ-7 code is gone: `SENSOR_MQ7` and
+> `METRIC_CO_SIGNAL` became `SENSOR_SGP30`, `METRIC_TVOC` and `METRIC_CO2EQ`
+> (`Snapshot` 528 -> 584 bytes), and `drivers/mq7.*` became the `drivers/sgp30.*`
+> stub with its own `test_sgp30` env.
 
 New layered FreeRTOS firmware. The design authority is
-[`Firmware Architecture.pdf`](Firmware%20Architecture.pdf), Rev 1 (its source is
-`Hydroponics-Monitoring-System-master/Documentation/Firmware Architecture.md`).
-Section numbers (§) below refer to that document. The old team code is kept
-unchanged and is used only as reference.
+[`Firmware Architecture.pdf`](Firmware%20Architecture.pdf), Rev 3 (22 Oct 2026). Its
+editable source is [`docs/architecture/`](docs/architecture/); rebuild with
+`python docs/architecture/build.py` (needs ReportLab). Section numbers (§) below
+refer to Rev 3. The old team code is kept unchanged and is used only as reference.
 
-**Status: Stage 1 skeleton.** The shared contracts are in place and every
-module exists as a stub that compiles. No sensor works yet. Nothing has been
-built with PlatformIO or run on hardware yet (see "First checks").
+**Status: Stage 1 skeleton plus first drivers.** The shared contracts are in
+place and every module exists and compiles. The BME280 (WP1) and pH (WP5)
+drivers are written; the others are still stubs (see "Work packages").
 
 ## Language: C (migrated from C++, October 2026)
 
@@ -30,18 +49,15 @@ Arduino-ESP32 on the same pinned platform, so the SDK settings below still apply
 The framework is C++ inside, but project code only uses its C APIs (`esp32-hal-*`,
 FreeRTOS, `esp_timer`).
 
-> **Design-authority conflict:** `Firmware Architecture.md` (Rev 1) still says to
-> "retain PlatformIO, Arduino and C++" (§ on the baseline) and to "use .h/.cpp for
-> the Arduino C++ application" (§5). This migration departs from those two
-> sentences. Update the architecture document, or record the decision, at the next
-> revision. `Stage 1 Report.html` also still describes the C++ code.
+The architecture records this as decision **D17** (Rev 3, §7 and §20).
+`Stage 1 Report.html` still describes the C++ code.
 
 How the C++ constructs map to C:
 
 | C++ | C |
 |-----|-----|
 | `namespace cfg` / `board` constants | `CFG_*` / `BOARD_*` macros with the original types, e.g. `CFG_BME280_PERIOD_MS`, `BOARD_PIN_I2C_SDA` |
-| `enum class X : uint8_t` | `typedef uint8_t X;` plus prefixed constants (`SENSOR_*`, `METRIC_*`, `UNIT_*`, `HEALTH_*`, `DRIVER_*`, `CAPTURE_*`, `POWER_MODE_*`, `TASK_ID_*`, `LOG_LEVEL_*`, ...). Records keep their C++ size. `reading.c` checks `sizeof(Reading) == 56` and `sizeof(Snapshot) == 528` at compile time. |
+| `enum class X : uint8_t` | `typedef uint8_t X;` plus prefixed constants (`SENSOR_*`, `METRIC_*`, `UNIT_*`, `HEALTH_*`, `DRIVER_*`, `CAPTURE_*`, `POWER_MODE_*`, `TASK_ID_*`, `LOG_LEVEL_*`, ...). Records keep their C++ size. `reading.c` checks `sizeof(Reading) == 56` and `sizeof(Snapshot) == 584` at compile time (528 before the SGP30 replaced the MQ-7). |
 | `kSensorCount` / `kMetricCount` | `SENSOR_COUNT` / `METRIC_COUNT` |
 | `cfg::taskSpec(id)` | `cfgTaskSpec(id)`, which returns `const TaskSpec*` |
 | HAL classes (`I2cBus`, `OneWireBus`, `AdcChannel`, `PulseCapture`) | A struct plus `i2cBusBegin(&bus, ...)`-style functions. Initialise statics with `I2C_BUS_INIT`, `ONE_WIRE_BUS_INIT`, `ADC_CHANNEL_INIT` or `PULSE_CAPTURE_INIT`. Members ending in `_` are private. |
@@ -62,7 +78,7 @@ libraries and no project code uses them. From C, WP8 can use the NimBLE host C
 API (`ble_gatts_*`, `ble_gap_*`) that NimBLE-Arduino bundles, and cJSON or `snprintf`
 for frames.
 
-## Layout (§5)
+## Layout (§7)
 
 ```text
 firmware/
@@ -78,6 +94,7 @@ firmware/
   src/diagnostics/          logger, progress counters
   test/bringup/             bringup_harness.h + one <sensor>_main.c per sensor
   test/native/              host unit tests for src/domain
+  docs/architecture/        ReportLab source of Firmware Architecture.pdf
 ```
 
 ## Layer rules (do not break these)
@@ -113,23 +130,24 @@ To change one, open a short review with the team lead. Do not edit them inside a
 | WP3 | DFR0026 light + ADC HAL | `drivers/light.*`, `hal/adc_channel.*` | 2 | — |
 | WP4 | HC-SR04 + pulse capture (RMT) | `drivers/hcsr04.*`, `hal/pulse_capture.*` | 3 | ECHO divider verified |
 | WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration") |
-| WP6 | MQ-7 heater/conditioning | `drivers/mq7.*` | 3 | module identity, heater access |
+| WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `test/bringup/sgp30_main.c` | 2 | raw 16-bit command write/read in the I2C HAL |
 | WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*` | 4 | ≥1 working driver; thresholds |
 | WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*` | 5 | WP7 snapshot |
-| WP9 | Power ISR, rail epoch, lease handover | `services/power_coordinator.*`, `services/rail_state.*` | 6 | power-sense GPIO and conditioning |
+| WP9 | Power ISR, rail epoch, lease handover | `services/power_coordinator.*`, `services/rail_state.*` | 6 | power sense on GPIO8 measured on the board |
 | WP10 | Logger queue, supervisor, watchdogs | `diagnostics/*`, `services/supervisor.*` | 4 | — |
 
-WP1 to WP3 and WP10 can start in parallel right away. A driver counts as done when it meets the "Completion evidence" column of the §14 table. Compiling is not enough.
+WP2, WP3, WP6 and WP10 can start in parallel. A driver counts as done when it meets the "Completion evidence" column of the §16 table. Compiling is not enough.
 
-## Commissioning gates (hardware, §18)
+## Commissioning gates (hardware, §20)
 
-The following are still `BOARD_PIN_UNASSIGNED` or unknown. Do not guess them in code.
+The pins below are now on the drawing, but their behaviour must be measured on
+the board before the matching feature is switched on. Do not guess the open items in code.
 
-- External-power-present GPIO, its voltage conditioning and hysteresis
-- 5 V rail feedback
-- Relay GPIO, polarity, NO/NC contacts and the load-safe state. The relay part label also needs resolving (IRLZ440N vs IRF4905).
-- MQ-7 heater control
-- Light ADC headroom, and the pH range measured on the board (nominally 3.0 V max at the pin)
+- External-power sense on GPIO8: actual levels at the real USB voltage (~3.33 V at 5.00 V, ~3.5 V at 5.25 V), decay and bounce. The divider has no hysteresis.
+- Per-branch 5 V rail feedback: not on the drawing; use measured settle timing.
+- Relay on GPIO15 (active-high, IRLZ44N): which contact (NO/NC) is used, the driven load and its safe state.
+- SGP30 module: 3.3 V supply and logic levels, pull-ups, baseline storage policy.
+- Light ADC headroom (the DFR0026 can exceed the S3's ~3.1 V range), and the pH range measured on the board (nominally 3.0 V max at the pin)
 - All trip and clear thresholds
 
 ## Build and test
@@ -165,7 +183,7 @@ If the first build fails:
 
 Wiring: PO -> 10 kOhm -> GPIO7 (ADC1_CH6), 15 kOhm and 1 uF to GND. DO and TO
 are not connected. A 5 V module output is 3.0 V at the pin, inside the S3's
-~3.1 V range at 11 dB (the ~2.45 V limit in §3 is for the original ESP32).
+~3.1 V range at 11 dB (the ~2.45 V limit in Rev 1-2 was for the original ESP32).
 
 The driver averages a spaced window: 10 conversions 30 ms apart, sorted, mean of
 the middle 6 (the tutorial's filter). Until two buffer points are entered it
@@ -225,14 +243,14 @@ PlatformIO Core 6.2.0 on Windows. The first build downloads about 1 GB of toolch
 - NimBLE-Arduino 2.5.1
 - ArduinoJson 6.21.5
 
-**Resolved SDK configuration** (`tools/sdk/esp32/sdkconfig`, checked against §13):
+**Resolved SDK configuration** (`tools/sdk/esp32/sdkconfig`, checked against §15):
 
 | Setting | Value | Consequence |
 |---------|-------|-------------|
 | `CONFIG_FREERTOS_HZ` | 1000 | 1 ms tick. `pdMS_TO_TICKS` is exact. |
-| `CONFIG_FREERTOS_UNICORE` | not set | Dual core. "Low-power single core" means only application affinity (§13). |
-| `CONFIG_PM_ENABLE` | not set | No automatic DFS or light sleep with this framework build (§13). |
-| `CONFIG_BTDM_CTRL_PINNED_TO_CORE` | 0 | BT controller on core 0, as §6 assumes. NimBLE host affinity is still to be checked in WP8. |
+| `CONFIG_FREERTOS_UNICORE` | not set | Dual core. "Low-power single core" means only application affinity (§15). |
+| `CONFIG_PM_ENABLE` | not set | No automatic DFS or light sleep with this framework build (§15). |
+| `CONFIG_BTDM_CTRL_PINNED_TO_CORE` | 0 | BT controller on core 0, as §8 assumes. NimBLE host affinity is still to be checked in WP8. |
 | `CONFIG_ARDUINO_RUNNING_CORE` | 1 | `loop()` task on core 1. It blocks forever. |
 | `CONFIG_ESP_TASK_WDT_TIMEOUT_S` | 5 | Matches `CFG_TASK_WATCHDOG_MS`. |
 

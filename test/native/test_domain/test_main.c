@@ -34,10 +34,10 @@ static void test_fault_is_not_masked_by_staleness(void) {
 }
 
 static void test_divider_recovery_uses_nominal_ratios(void) {
-  // MQ-7: 22k/18k => x40/18. 1800 mV at the pin -> 4000 mV at the module.
-  TEST_ASSERT_FLOAT_WITHIN(0.5f, 4000.0f,
-                           dividerRecoverMv(1800.0f, BOARD_MQ7_DIVIDER_TOP_OHM,
-                                            BOARD_MQ7_DIVIDER_BOTTOM_OHM));
+  // Power sense: 220/440 => x660/440. 3333 mV at GPIO8 -> 5000 mV external feed.
+  TEST_ASSERT_FLOAT_WITHIN(0.5f, 4999.5f,
+                           dividerRecoverMv(3333.0f, BOARD_POWER_SENSE_DIVIDER_TOP_OHM,
+                                            BOARD_POWER_SENSE_DIVIDER_BOTTOM_OHM));
   // pH: 10k/15k => x25/15. 3000 mV at the pin -> 5000 mV at the module.
   TEST_ASSERT_FLOAT_WITHIN(0.5f, 5000.0f,
                            dividerRecoverMv(3000.0f, BOARD_PH_DIVIDER_TOP_OHM,
@@ -75,7 +75,7 @@ static void test_snapshot_reset_indexes_by_metric(void) {
 
 static void test_production_ready_requires_power_sense(void) {
   BoardValidation v = boardProfileValidate();
-  if (!v.powerSenseAssigned) TEST_ASSERT_FALSE(v.productionReady);
+  if (!v.powerSenseAssigned || !BOARD_POWER_SENSE_VERIFIED) TEST_ASSERT_FALSE(v.productionReady);
 }
 
 int main(int argc, char** argv) {
