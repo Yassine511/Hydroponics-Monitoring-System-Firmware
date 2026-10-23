@@ -35,8 +35,8 @@ editable source is [`docs/architecture/`](docs/architecture/); rebuild with
 refer to Rev 3. The old team code is kept unchanged and is used only as reference.
 
 **Status: Stage 1 skeleton plus first drivers.** The shared contracts are in
-place and every module exists and compiles. The BME280 (WP1), pH (WP5) and SGP30
-(WP6) drivers are written; the others are still stubs (see "Work packages").
+place and every module exists and compiles. The BME280 (WP1), light (WP3), pH (WP5)
+and SGP30 (WP6) drivers are written; the others are still stubs (see "Work packages").
 
 ## Language: C (migrated from C++, October 2026)
 
@@ -127,7 +127,7 @@ To change one, open a short review with the team lead. Do not edit them inside a
 |----|-------|-------|-------|------------|
 | WP1 | **BME280** + I2C HAL | `drivers/bme280.*`, `hal/i2c_bus.*`, `test/bringup/bme280_main.c` | 2 | — (**running on S3 hardware 8 Oct 2026: ID 0x60 @0x76, 250 ms cadence, took 11 ms; fault/recovery tests pending**) |
 | WP2 | DS18B20 + 1-Wire HAL | `drivers/ds18b20.*`, `hal/onewire_bus.*` | 2 | — |
-| WP3 | DFR0026 light + ADC HAL | `drivers/light.*`, `hal/adc_channel.*` | 2 | — |
+| WP3 | DFR0026 light + ADC HAL | `drivers/light.*`, `hal/adc_channel.*` | 2 | — (**driver written 23 Oct 2026, publishes module mV (uncalibrated, no lux); running on S3 hardware 23 Oct 2026: dark 0 mV, room ~65 mV, clips at 3157 mV; unplug behaviour and LED-flicker spread not yet measured** — see "DFR0026 light bring-up") |
 | WP4 | HC-SR04 + pulse capture (RMT) | `drivers/hcsr04.*`, `hal/pulse_capture.*` | 3 | ECHO divider verified |
 | WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration") |
 | WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `domain/sgp30_codec.*`, `hal/i2c_bus.*` (raw write/read), `test/bringup/sgp30_main.c`, `test/bringup/climate_main.c` | 2 | — (**running on S3 hardware 22 Oct 2026: feature set 0x0020 @0x58, 1 s cadence, 13 ms per measurement, no CRC faults; breath and hand-sanitiser spikes seen. Runs with the BME280 on the shared bus in `test_climate`, with humidity compensation. Baseline save/restore, 12 h learning and fault recovery not yet tested**; baseline is RAM-only until WP8 stores it in NVS) |
@@ -221,6 +221,40 @@ vinegar 3.6 and baking soda 7.8.
 
 Production code does not store the calibration yet. Keeping the fit in NVS is
 WP8 (`services/configuration`).
+
+## DFR0026 light bring-up (WP3)
+
+Wiring: S -> 10 kOhm -> GPIO1 (ADC1_CH0), 1 uF to GND (tau ~10 ms), module on the
+retained 3.3 V supply. There is no divider, so pin mV is the module output.
+
+The driver averages 10 conversions 11 ms apart (sorted, mean of the middle 6,
+~100 ms per window). The spacing is not a multiple of 10 ms on purpose: lamps
+flicker at 100/120 Hz and the RC only partly filters it, so each tap lands on a
+different flicker phase. Every reading is module mV with `HEALTH_UNCALIBRATED`.
+The datasheet gives no lux conversion, and `types.h` has no lux unit. Lux needs a
+reference-meter mapping plus a reviewed `UNIT_LUX` (D13). A clipped tap (bright
+light, ~3050 mV) sets `kQualitySaturated`, and the value is then a lower bound,
+not a fault. The handover code's raw `analogRead` counts are not reused.
+
+```bash
+pio run -e test_light -t upload -t monitor
+```
+
+Record the mV for: covered (dark), room light, phone torch (clip point), the
+line-to-line spread under LED/fluorescent light, and what happens when S is
+unplugged (the 1 uF holds the last level; the driver cannot detect it). WP3 is
+done once these are filled in:
+
+| Condition | Measured (23 Oct 2026, `test_light`, 99 ms per window) |
+|-----------|----------|
+| Dark (covered) | 0 mV fully covered; ~21 mV (20.5-22) with a hand that lets some light in |
+| Room light | ~65 mV in a dim room; ~324 mV (323-325, +/-1 mV) with brighter room lighting |
+| Torch / saturation | rises through ~480-1190 mV, clips flat at 3157 mV (above the HAL's 3050 mV flag, so `kQualitySaturated` is set) |
+| Spread under LED light | not measured yet |
+| S unplugged | not measured yet |
+
+Response time is within one 1 s frame in both directions (dark -> torch ~3 frames
+while the torch was brought closer; torch -> covered 0 mV in ~3 frames).
 
 ## Stage 1 build record (4 October 2026)
 
