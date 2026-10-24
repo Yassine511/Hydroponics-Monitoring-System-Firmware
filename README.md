@@ -35,8 +35,8 @@ editable source is [`docs/architecture/`](docs/architecture/); rebuild with
 refer to Rev 3. The old team code is kept unchanged and is used only as reference.
 
 **Status: Stage 1 skeleton plus first drivers.** The shared contracts are in
-place and every module exists and compiles. The BME280 (WP1), light (WP3), HC-SR04 (WP4),
-pH (WP5) and SGP30 (WP6) drivers are written; the others are still stubs (see "Work packages").
+place and every module exists and compiles. The BME280 (WP1), DS18B20 (WP2), light (WP3), HC-SR04 (WP4),
+pH and TDS (WP5) and SGP30 (WP6) drivers are written; the others are still stubs (see "Work packages").
 
 ## Language: C (migrated from C++, October 2026)
 
@@ -126,10 +126,10 @@ To change one, open a short review with the team lead. Do not edit them inside a
 | WP | Scope | Files | Stage | Blocked by |
 |----|-------|-------|-------|------------|
 | WP1 | **BME280** + I2C HAL | `drivers/bme280.*`, `hal/i2c_bus.*`, `test/bringup/bme280_main.c` | 2 | — (**running on S3 hardware 8 Oct 2026: ID 0x60 @0x76, 250 ms cadence, took 11 ms; fault/recovery tests pending**) |
-| WP2 | DS18B20 + 1-Wire HAL | `drivers/ds18b20.*`, `hal/onewire_bus.*` | 2 | — |
+| WP2 | DS18B20 + 1-Wire HAL | `drivers/ds18b20.*`, `hal/onewire_bus.*`, `domain/ds18b20_codec.*` | 2 | — (**driver + bit-banged 1-Wire HAL written 24 Oct 2026, 12-bit, Match ROM, CRC and 85 degC checks; running on S3 hardware 24 Oct 2026: ROM 28-00000098BB42, 762 ms per reading, 0 faults in ~200 readings; reference-thermometer check, unplug and supply-loss tests pending** — see "DS18B20 bring-up") |
 | WP3 | DFR0026 light + ADC HAL | `drivers/light.*`, `hal/adc_channel.*` | 2 | — (**driver written 23 Oct 2026, publishes module mV (uncalibrated, no lux); running on S3 hardware 23 Oct 2026: dark 0 mV, room ~65 mV, clips at 3157 mV; unplug behaviour and LED-flicker spread not yet measured** — see "DFR0026 light bring-up") |
 | WP4 | HC-SR04 + pulse capture (GPIO edge ISR + `esp_timer`) | `drivers/hcsr04.*`, `hal/pulse_capture.*`, `domain/ultrasonic.*` | 3 | ECHO divider verified (**driver written 24 Oct 2026, nominal 343 m/s, no temperature compensation; not yet run on hardware** — see "HC-SR04 bring-up") |
-| WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration") |
+| WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*`, `domain/tds_codec.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration". **TDS driver written 24 Oct 2026, nominal datasheet curve (uncalibrated); running on S3 hardware 24 Oct 2026: air 0 mV, tap ~1245 mV, hot ~1922 mV, salted water over range (FAULT); compensation checked with the DS18B20 in `test_water` (switched to ppm/EC compensation, ~5 % across 11-34 degC); reference solution not yet tested** — see "SEN0244 TDS bring-up") |
 | WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `domain/sgp30_codec.*`, `hal/i2c_bus.*` (raw write/read), `test/bringup/sgp30_main.c`, `test/bringup/climate_main.c` | 2 | — (**running on S3 hardware 22 Oct 2026: feature set 0x0020 @0x58, 1 s cadence, 13 ms per measurement, no CRC faults; breath and hand-sanitiser spikes seen. Runs with the BME280 on the shared bus in `test_climate`, with humidity compensation. Baseline save/restore, 12 h learning and fault recovery not yet tested**; baseline is RAM-only until WP8 stores it in NVS) |
 | WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*` | 4 | ≥1 working driver; thresholds |
 | WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*` | 5 | WP7 snapshot |
@@ -221,6 +221,169 @@ vinegar 3.6 and baking soda 7.8.
 
 Production code does not store the calibration yet. Keeping the fit in NVS is
 WP8 (`services/configuration`).
+
+## DS18B20 bring-up (WP2)
+
+Wiring: DQ -> GPIO14 with 4.7 kOhm to 3.3 V, sensor on the retained 3.3 V supply
+(external power, not parasite mode). The 1-Wire bus is bit-banged on an
+open-drain pin (`hal/onewire_bus.c`), with standard-speed timing from the
+datasheet. Each time slot (<= 70 us) runs with interrupts off on that core.
+The 480 us reset-low phase runs with interrupts on.
+
+`init()` finds the first device with Search ROM, checks the ROM CRC and the
+family code (28h), and from then on addresses only that ROM (Match ROM). If the
+EEPROM holds a lower resolution, it writes 12-bit to the scratchpad only, never
+to EEPROM, and does this again on every init. Each 1 s frame: `start()` sends
+Convert T, the driver waits the full 750 ms, then reads the 9-byte scratchpad
+once (~12 ms).
+
+| Situation | Reading |
+|-----------|---------|
+| Valid scratchpad, -55..+125 degC | value in degC, `HEALTH_OK`, raw = register (1/16 degC) |
+| Scratchpad CRC wrong, or config fixed bits wrong (all-zero read) | `HEALTH_FAULT`, no raw |
+| Register = 0550h (+85 degC power-on value) | `HEALTH_FAULT`; the next frame re-inits |
+| Outside -55..+125 degC | `HEALTH_FAULT` |
+| No presence pulse | `init -> NOT_PRESENT` or `poll -> NOT_PRESENT`, re-init next frame |
+| `init -> FAULT` repeatedly on a sensor that answers | the scratchpad config byte fails the fixed-bit check; suspect a clone part |
+
+The TDS driver takes this reading through `tdsDriverSetWaterTemperature()`.
+`test_water` (see "Water probes together") passes it across in bring-up.
+Production acquisition (WP7) still has to do the same.
+
+```bash
+pio run -e test_ds18b20 -t upload -t monitor
+```
+
+WP2 is done once these are filled in:
+
+| Check | Measured |
+|-------|----------|
+| ROM code printed at boot | `28-00000098BB42 crc C7` (24 Oct 2026, `test_ds18b20`) |
+| Room air vs reference thermometer | 26.00-26.12 degC in room air; no reference thermometer yet |
+| Ice water (0 degC) / warm water | tap water ~24.8 degC (still falling slowly); hot water settled at 47.19 degC. Air -> hot water: 24.8 -> 43 degC in ~12 s. Hot -> tap water: 43 -> 27 degC in ~18 s. Ice water not tried yet |
+| Line-to-line spread | +/-0.06 degC (one 12-bit step) when settled |
+| DQ unplugged, then replugged (recovery) | not measured yet |
+| Supply removed, then restored (85 degC check) | not measured yet |
+| Start-to-ready time printed by the harness (~760 ms expected) | 762 ms on every reading; no FAULT/NOT_PRESENT in a 3 min run with water changes |
+
+## Water probes together (`test_water`)
+
+`test/bringup/water_main.c` runs the DS18B20 and the TDS driver from one task
+with a 1 s frame, like `test_climate` does for the I2C pair. Each frame:
+
+1. It passes the latest DS18B20 reading, from the previous frame, to the TDS
+   driver with `tdsDriverSetWaterTemperature()`. A faulty reading is passed
+   as is, so the TDS driver reports `NO TEMP` instead of using it. After a
+   `NOPRES` frame the last good reading is still used until it is 3 s old.
+2. It starts both drivers and polls them in turn. The 750 ms DS18B20
+   conversion and the ~560 ms TDS window overlap, so both fit in one frame. Run
+   one after the other, they would take ~1.3 s.
+
+TDS is therefore compensated with a water temperature about 1 s old, inside
+the 3 s staleness limit. The first frame has no temperature yet, so it shows
+`NO TEMP`.
+
+```bash
+pio run -e test_water -t upload -t monitor
+```
+
+Output is one table row per second, with the header repeated every 20 rows:
+
+```text
+        | DS18B20 |  SEN0244 TDS                                |
+   time | water T |    raw | uncomp |   @25C | state   | trend    |
+      s |    degC |     mV |    ppm |    ppm |         |          |
+--------+---------+--------+--------+--------+---------+----------+
+     12 |   24.81 |   1245 |    470 |    466 | UNCAL   | stable   |
+     55 |   51.94 |   1922 |    825 |    465 | UNCAL   | stable   |
+     90 |  NOPRES |   1921 |    824 |      - | NO TEMP | stable   |
+```
+
+| Column | Meaning |
+|--------|---------|
+| water T | DS18B20 in degC, or `FAULT`, `NOPRES` (no presence pulse), `TIMEOUT`, `-` (no result yet) |
+| raw | TDS pin mV (filtered window) |
+| uncomp | ppm from raw without temperature compensation |
+| @25C | ppm compensated to 25 degC, the value production uses; `-` without a fresh water temperature |
+| state | `OK`, `UNCAL` (nominal curve, no K-factor), `NO TEMP`, `OVER` (above 1000 ppm or ADC clipped), `FAULT` |
+| trend | `stable` once the shown ppm (`@25C`, else `uncomp`) stops drifting: over the last 10 rows, the newer 5 average within 0.4 % (min 2 ppm) of the older 5, and no row is more than 2 % off. Else `settling` |
+
+In a new cup, `raw` and `uncomp` jump within a second, but the DS18B20 takes
+~20 s to get most of the way to the water temperature, then creeps for a minute
+or more. Until then, `@25C` is off (it can even show a brief false `OVER`). Read
+the row once `trend` says `stable`. Same tap water, cold and hot: `uncomp` differs, `@25C` should
+match. Events (init, faults, ROM code, compensation on/off, first timings)
+print as `# ...` lines between rows. Checks to record:
+
+| Check | Measured |
+|-------|----------|
+| Compensation switches ON after the first frame | yes: frame 1 `NO TEMP`, frame 2 compensated (24 Oct 2026) |
+| Same solution at two temperatures (compensated ppm should match within ~10 %) | tap water at 11.4 degC (1234 mV), 33.6 degC (1768 mV), 11.6 degC (1278 mV): 631 / 620 / 653 ppm after the change to ppm compensation (~5 %). Recomputed from the logged raw mV and temperatures; the first firmware compensated the voltage and gave 683 / 584 / 713 |
+| Over range | salted water 2380-2386 mV -> `OVER` at 22-24 degC |
+| DS18B20 unplugged: TDS falls back to `NO TEMP` (within ~3 s) | not measured yet |
+| No `TIMEOUT (frame guard)` lines over a long run | none in ~4.5 min |
+| Re-run with the ppm-compensated firmware and the new trend rule | 24 Oct 2026, read at `stable`: tap water 16.0 degC / 1467 mV -> 688 ppm; warm 42.0 degC / 1957 mV -> 634 ppm (8 % apart; `uncomp` 565 vs 849). Salt: raw pinned at 2378-2386 mV from 42 down to 25 degC, so the module output is clipped (~2.38 V) and the ppm is meaningless; `OVER` throughout once compensated, correct. `stable` took ~30 s (cold), ~55 s (warm), ~45 s (salt) |
+
+## SEN0244 TDS bring-up (WP5)
+
+Wiring: A -> GPIO6 (ADC1_CH5), 100 nF to GND, module on the filtered switched
+5 V rail. There is no divider, so pin mV is the module output (0-2.3 V nominal).
+The probe is waterproof but the board and connectors are not, and the probe must
+stay in water below 55 degC, away from the container wall (datasheet).
+
+The driver averages 15 conversions 40 ms apart (sorted, mean of the middle 5,
+~560 ms per window). The datasheet sample takes the median of 30 taps 40 ms apart,
+which is ~1.2 s and would not fit the 1 s frame. The conversion is in
+`domain/tds_codec.c` and is host-tested:
+`ppm = (133.42 V^3 - 255.86 V^2 + 857.39 V) x 0.5 / (1 + 0.02 (T - 25))`.
+
+The temperature compensation divides the **ppm** (conductivity), as DFRobot's
+GravityTDS library does. The datasheet's sample sketch divides the **voltage**
+before the curve instead. The curve is not linear, so that over-corrects. With
+the same tap water at 11.4 / 33.6 / 11.6 degC (`test_water`, 24 Oct 2026):
+
+| Method | @25C ppm (cold / warm / cold) | Spread |
+|--------|-------------------------------|--------|
+| Voltage compensated (datasheet sketch, first version) | 683 / 584 / 713 | ~20 % |
+| ppm compensated (GravityTDS, current) | 631 / 620 / 653 | ~5 % |
+
+`TdsConfig.calibration` is an optional K-factor on that ppm (slope = K, offset 0),
+to be fitted against a reference solution. raw is always the filtered pin mV.
+
+| Situation | Reading |
+|-----------|---------|
+| ADC clipped, or ppm above the rated 1000 ppm | value kept, `kQualitySaturated` + `HEALTH_FAULT` |
+| No OK DS18B20 reading younger than 3 s, or outside 0-55 degC | uncompensated value, `kQualityUncompensated` + `HEALTH_DEPENDENCY_INVALID` |
+| Compensated, no K-factor | ppm, `HEALTH_UNCALIBRATED` (nominal curve, D13) |
+| Compensated, K-factor set | ppm, `HEALTH_OK` |
+
+The 0-1000 ppm range is below many hydroponic nutrient solutions (often
+1000-1500 ppm or more). Those readings are FAULT and never actionable. 0 V is
+distilled water, a probe in air, an open lead or a dead rail alike, so the
+driver cannot report `UNPOWERED`; that is left to acquisition (rail epoch, WP9).
+
+`test_tds` runs the TDS driver alone, without the DS18B20 (use `test_water` for both), so it prints
+`tds=DEPENDENCY_INVALID (raw <mV>)` by default. To see ppm, measure the water
+with a thermometer and set `TDS_MANUAL_WATER_TEMP_C` in
+`test/bringup/tds_main.c`. Bring-up then feeds that value as a fresh DS18B20
+reading every frame and prints `<ppm> ppm (uncal)`. This option exists only in
+bring-up.
+
+```bash
+pio run -e test_tds -t upload -t monitor
+```
+
+WP5 (TDS) is done once these are filled in:
+
+| Check | Measured |
+|-------|----------|
+| Probe in air | 0 mV (24 Oct 2026, `test_tds`) |
+| Distilled water | not measured yet |
+| Tap water (with water temperature) | 1232-1261 mV (~465 ppm on the nominal curve if at 25 degC; water temperature not measured in this run). Back in the same cup after hot and salt: 1264-1272 mV (+2 %) |
+| Reference solution (K-factor = reference / reading) | not measured yet |
+| Nutrient solution / over-range sample | salted water 2378-2383 mV -> `tds=FAULT` (above 1000 ppm), as designed. Hot tap water: 1914-1935 mV, uncompensated ~825 ppm (water temperatures not measured in this run; see `test_water` for compensated values) |
+| Line-to-line spread | about +/-10 mV settled (cold and hot); a few % drift in the first ~10 s after moving the probe |
+| Start-to-ready time printed by the harness | 560 ms on every reading |
 
 ## DFR0026 light bring-up (WP3)
 

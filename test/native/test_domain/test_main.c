@@ -4,8 +4,10 @@
 
 #include "board_profile.h"
 #include "domain/calibration.h"
+#include "domain/ds18b20_codec.h"
 #include "domain/reading.h"
 #include "domain/sgp30_codec.h"
+#include "domain/tds_codec.h"
 #include "domain/ultrasonic.h"
 
 void setUp(void) {}
@@ -139,6 +141,82 @@ static void test_ultrasonic_range_is_2_to_400_cm(void) {
   TEST_ASSERT_FALSE(ultrasonicInRangeMm(0.0f));  // never a valid distance
 }
 
+static void test_tds_datasheet_curve(void) {
+  // (133.42 - 255.86 + 857.39) * 0.5 at 1.0 V, 25 degC (SEN0244 sample code).
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 1.0f, tdsCompensationCoefficient(25.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 367.475f, tdsPpmFromModuleMv(1000.0f, 1.0f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, tdsPpmFromModuleMv(0.0f, 1.0f));
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, tdsPpmFromModuleMv(1000.0f, 0.0f));
+  // 2.3 V (top of the output range) is above the rated 1000 ppm.
+  TEST_ASSERT_FLOAT_WITHIN(0.5f, 1120.9f, tdsPpmFromModuleMv(2300.0f, 1.0f));
+  TEST_ASSERT_TRUE(tdsPpmFromModuleMv(2300.0f, 1.0f) > TDS_FULL_SCALE_PPM);
+}
+
+static void test_tds_temperature_compensation(void) {
+  // The conductivity (ppm) is compensated, not the voltage (GravityTDS).
+  const float coefficient = tdsCompensationCoefficient(35.0f);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 1.2f, coefficient);
+  TEST_ASSERT_FLOAT_WITHIN(0.01f, 367.475f / 1.2f, tdsPpmFromModuleMv(1000.0f, coefficient));
+  // Measured 24 Oct 2026, same tap water cold and warm: within ~2 % at 25 degC.
+  const float cold = tdsPpmFromModuleMv(1234.0f, tdsCompensationCoefficient(11.44f));
+  const float warm = tdsPpmFromModuleMv(1768.0f, tdsCompensationCoefficient(33.62f));
+  TEST_ASSERT_FLOAT_WITHIN(0.03f * cold, cold, warm);
+}
+
+// Scratchpad with the given temperature register and 12-bit config, valid CRC.
+static void makeScratchpad(int16_t raw, uint8_t sp[DS18B20_SCRATCHPAD_LEN]) {
+  const uint8_t base[8] = {(uint8_t)(raw & 0xFF), (uint8_t)((uint16_t)raw >> 8), 0x4B, 0x46,
+                           DS18B20_CONFIG_12BIT, 0xFF, 0x0C, 0x10};
+  for (uint8_t i = 0; i < 8; ++i) sp[i] = base[i];
+  sp[8] = oneWireCrc8(sp, 8);
+}
+
+static void test_onewire_crc_matches_maxim_vector(void) {
+  // Maxim application note 27: ROM 02 1C B8 01 00 00 00 has CRC A2.
+  const uint8_t rom[8] = {0x02, 0x1C, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xA2};
+  TEST_ASSERT_EQUAL_HEX8(0xA2, oneWireCrc8(rom, 7));
+  TEST_ASSERT_EQUAL_HEX8(0x00, oneWireCrc8(rom, 8));  // data + CRC -> 0
+  TEST_ASSERT_FALSE(ds18b20RomValid(rom));  // family 02h, not a DS18B20
+  uint8_t ds[8] = {0x28, 0xFF, 0x64, 0x1E, 0x0F, 0x4A, 0x3C, 0x00};
+  ds[7] = oneWireCrc8(ds, 7);
+  TEST_ASSERT_TRUE(ds18b20RomValid(ds));
+  ds[3] ^= 0x01;
+  TEST_ASSERT_FALSE(ds18b20RomValid(ds));
+  const uint8_t zero[8] = {0};  // bus stuck low: CRC 0 matches, family does not
+  TEST_ASSERT_FALSE(ds18b20RomValid(zero));
+}
+
+static void test_ds18b20_temperature_table(void) {
+  // Datasheet Table 1.
+  uint8_t sp[DS18B20_SCRATCHPAD_LEN];
+  makeScratchpad(0x0191, sp);
+  TEST_ASSERT_TRUE(ds18b20ScratchpadValid(sp));
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 25.0625f, ds18b20RawToDegC(ds18b20RawTemperature(sp)));
+  makeScratchpad((int16_t)0xFF5E, sp);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, -10.125f, ds18b20RawToDegC(ds18b20RawTemperature(sp)));
+  makeScratchpad((int16_t)0xFC90, sp);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, -55.0f, ds18b20RawToDegC(ds18b20RawTemperature(sp)));
+  makeScratchpad(0x07D0, sp);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 125.0f, ds18b20RawToDegC(ds18b20RawTemperature(sp)));
+  makeScratchpad(DS18B20_POWER_ON_RAW, sp);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 85.0f, ds18b20RawToDegC(ds18b20RawTemperature(sp)));
+}
+
+static void test_ds18b20_scratchpad_checks(void) {
+  uint8_t sp[DS18B20_SCRATCHPAD_LEN];
+  makeScratchpad(0x0191, sp);
+  sp[0] ^= 0x01;  // one bit flipped on the wire
+  TEST_ASSERT_FALSE(ds18b20ScratchpadValid(sp));
+  const uint8_t zero[DS18B20_SCRATCHPAD_LEN] = {0};  // CRC 0 matches, config does not
+  TEST_ASSERT_FALSE(ds18b20ScratchpadValid(zero));
+  uint8_t ff[DS18B20_SCRATCHPAD_LEN];  // floating / no device
+  for (uint8_t i = 0; i < DS18B20_SCRATCHPAD_LEN; ++i) ff[i] = 0xFF;
+  TEST_ASSERT_FALSE(ds18b20ScratchpadValid(ff));
+  TEST_ASSERT_TRUE(ds18b20Is12Bit(0x7F));
+  TEST_ASSERT_FALSE(ds18b20Is12Bit(0x5F));  // 11-bit
+  TEST_ASSERT_FALSE(ds18b20Is12Bit(0x1F));  // 9-bit
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -157,5 +235,10 @@ int main(int argc, char** argv) {
   RUN_TEST(test_sgp30_humidity_fixed_point);
   RUN_TEST(test_ultrasonic_echo_width_to_mm);
   RUN_TEST(test_ultrasonic_range_is_2_to_400_cm);
+  RUN_TEST(test_tds_datasheet_curve);
+  RUN_TEST(test_tds_temperature_compensation);
+  RUN_TEST(test_onewire_crc_matches_maxim_vector);
+  RUN_TEST(test_ds18b20_temperature_table);
+  RUN_TEST(test_ds18b20_scratchpad_checks);
   return UNITY_END();
 }
