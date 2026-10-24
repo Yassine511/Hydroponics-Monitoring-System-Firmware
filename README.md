@@ -35,8 +35,8 @@ editable source is [`docs/architecture/`](docs/architecture/); rebuild with
 refer to Rev 3. The old team code is kept unchanged and is used only as reference.
 
 **Status: Stage 1 skeleton plus first drivers.** The shared contracts are in
-place and every module exists and compiles. The BME280 (WP1), light (WP3), pH (WP5)
-and SGP30 (WP6) drivers are written; the others are still stubs (see "Work packages").
+place and every module exists and compiles. The BME280 (WP1), light (WP3), HC-SR04 (WP4),
+pH (WP5) and SGP30 (WP6) drivers are written; the others are still stubs (see "Work packages").
 
 ## Language: C (migrated from C++, October 2026)
 
@@ -128,7 +128,7 @@ To change one, open a short review with the team lead. Do not edit them inside a
 | WP1 | **BME280** + I2C HAL | `drivers/bme280.*`, `hal/i2c_bus.*`, `test/bringup/bme280_main.c` | 2 | — (**running on S3 hardware 8 Oct 2026: ID 0x60 @0x76, 250 ms cadence, took 11 ms; fault/recovery tests pending**) |
 | WP2 | DS18B20 + 1-Wire HAL | `drivers/ds18b20.*`, `hal/onewire_bus.*` | 2 | — |
 | WP3 | DFR0026 light + ADC HAL | `drivers/light.*`, `hal/adc_channel.*` | 2 | — (**driver written 23 Oct 2026, publishes module mV (uncalibrated, no lux); running on S3 hardware 23 Oct 2026: dark 0 mV, room ~65 mV, clips at 3157 mV; unplug behaviour and LED-flicker spread not yet measured** — see "DFR0026 light bring-up") |
-| WP4 | HC-SR04 + pulse capture (RMT) | `drivers/hcsr04.*`, `hal/pulse_capture.*` | 3 | ECHO divider verified |
+| WP4 | HC-SR04 + pulse capture (GPIO edge ISR + `esp_timer`) | `drivers/hcsr04.*`, `hal/pulse_capture.*`, `domain/ultrasonic.*` | 3 | ECHO divider verified (**driver written 24 Oct 2026, nominal 343 m/s, no temperature compensation; not yet run on hardware** — see "HC-SR04 bring-up") |
 | WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration") |
 | WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `domain/sgp30_codec.*`, `hal/i2c_bus.*` (raw write/read), `test/bringup/sgp30_main.c`, `test/bringup/climate_main.c` | 2 | — (**running on S3 hardware 22 Oct 2026: feature set 0x0020 @0x58, 1 s cadence, 13 ms per measurement, no CRC faults; breath and hand-sanitiser spikes seen. Runs with the BME280 on the shared bus in `test_climate`, with humidity compensation. Baseline save/restore, 12 h learning and fault recovery not yet tested**; baseline is RAM-only until WP8 stores it in NVS) |
 | WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*` | 4 | ≥1 working driver; thresholds |
@@ -255,6 +255,52 @@ done once these are filled in:
 
 Response time is within one 1 s frame in both directions (dark -> torch ~3 frames
 while the torch was brought closer; torch -> covered 0 mV in ~3 frames).
+
+## HC-SR04 bring-up (WP4)
+
+Wiring: module on the switched external 5 V. TRIG <- GPIO17 (3.3 V logic, inside
+the module's TTL input range). ECHO -> 1 kOhm -> GPIO18, 2 kOhm to GND, so 5 V
+at the module is ~3.33 V at the pin. **Check the divider before connecting
+GPIO18:** with the module's ECHO wire disconnected, put 5 V on the module side
+of the 1 kOhm and measure about 3.3 V at the junction (or scope the junction on
+a running module). Never force the module's ECHO output to 5 V.
+
+The ECHO pulse is timed by a CHANGE interrupt that stores `esp_timer`
+microsecond timestamps (`hal/pulse_capture.c`). `pulseIn()` is not used. One
+ping per 1 s frame, 10 us trigger, 30 ms timeout (`CFG_HCSR04_TIMEOUT_MS`).
+Distance = width x 343 m/s / 2 (58.3 us/cm), with no air-temperature
+compensation (~0.17 %/degC), so every reading carries `kQualityUncompensated`.
+A missing distance is never 0:
+
+| Situation | Reading |
+|-----------|---------|
+| Echo 20-4000 mm | value in mm, `HEALTH_OK` |
+| Echo outside 2-400 cm | `HEALTH_FAULT`, raw = width in us |
+| ECHO rose but did not fall within 30 ms (nothing in range) | `HEALTH_TIMEOUT`, raw = elapsed us |
+| ECHO never rose (stuck low, unplugged, 5 V rail off) | `HEALTH_TIMEOUT`, no raw |
+| ECHO high before the trigger (stuck high) | `init`/`start -> FAULT` |
+
+There is no rail-feedback pin, so "rail off" cannot be told apart from
+"stuck low". `UNPOWERED` is left to acquisition (rail epoch, WP9). Do not test
+"rail off" with `test_hcsr04` running: the harness keeps pulsing TRIG high into
+the unpowered module (§12).
+
+```bash
+pio run -e test_hcsr04 -t upload -t monitor
+```
+
+WP4 is done once these are filled in:
+
+| Check | Measured |
+|-------|----------|
+| GPIO18 level with ECHO high (divider) | not measured yet |
+| Flat target at 10 / 50 / 100 cm (tape vs reading, spread) | not measured yet |
+| Open space (> 4 m) | not measured yet |
+| ECHO unplugged at the module side (not at GPIO18: no pull, it floats) | not measured yet |
+| ECHO held high | not measured yet |
+| Target < 2 cm | not measured yet |
+| Start-to-ready time printed by the harness | not measured yet |
+| Mounting height above the tank, empty/full mapping | not measured yet |
 
 ## Stage 1 build record (4 October 2026)
 

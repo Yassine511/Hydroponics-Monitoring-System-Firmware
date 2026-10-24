@@ -6,6 +6,7 @@
 #include "domain/calibration.h"
 #include "domain/reading.h"
 #include "domain/sgp30_codec.h"
+#include "domain/ultrasonic.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -121,6 +122,23 @@ static void test_sgp30_humidity_fixed_point(void) {
   TEST_ASSERT_TRUE(sgp30AbsoluteHumidity(25.0f, 120.0f) < 0.0f);
 }
 
+static void test_ultrasonic_echo_width_to_mm(void) {
+  // 58.3 us per cm at 343 m/s (HC-SR04 guide, equation 3).
+  TEST_ASSERT_FLOAT_WITHIN(0.1f, 1000.0f,
+                           ultrasonicEchoUsToMm(5831, ULTRASONIC_NOMINAL_SPEED_MPS));
+  TEST_ASSERT_FLOAT_WITHIN(0.1f, 20.0f,
+                           ultrasonicEchoUsToMm(117, ULTRASONIC_NOMINAL_SPEED_MPS));
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, ultrasonicEchoUsToMm(0, ULTRASONIC_NOMINAL_SPEED_MPS));
+}
+
+static void test_ultrasonic_range_is_2_to_400_cm(void) {
+  TEST_ASSERT_TRUE(ultrasonicInRangeMm(20.0f));
+  TEST_ASSERT_TRUE(ultrasonicInRangeMm(4000.0f));
+  TEST_ASSERT_FALSE(ultrasonicInRangeMm(19.9f));
+  TEST_ASSERT_FALSE(ultrasonicInRangeMm(4000.1f));
+  TEST_ASSERT_FALSE(ultrasonicInRangeMm(0.0f));  // never a valid distance
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -137,5 +155,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_sgp30_crc_matches_datasheet_vector);
   RUN_TEST(test_sgp30_words_round_trip_and_reject_bad_crc);
   RUN_TEST(test_sgp30_humidity_fixed_point);
+  RUN_TEST(test_ultrasonic_echo_width_to_mm);
+  RUN_TEST(test_ultrasonic_range_is_2_to_400_cm);
   return UNITY_END();
 }
