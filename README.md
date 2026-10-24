@@ -145,7 +145,7 @@ the board before the matching feature is switched on. Do not guess the open item
 
 - External-power sense on GPIO8: actual levels at the real USB voltage (~3.33 V at 5.00 V, ~3.5 V at 5.25 V), decay and bounce. The divider has no hysteresis.
 - Per-branch 5 V rail feedback: not on the drawing; use measured settle timing.
-- Relay on GPIO15 (active-high, IRLZ44N): which contact (NO/NC) is used, the driven load and its safe state.
+- Relay on GPIO15 (active-high, IRLZ44N): which contact (NO/NC) is used, the driven load and its safe state. Breadboard answer (`test_lamp`): grow lamp on NO, de-energised = lamp OFF; PCB still pending.
 - SGP30 module: 3.3 V supply and logic levels, pull-ups, baseline storage policy.
 - Light ADC headroom (the DFR0026 can exceed the S3's ~3.1 V range), and the pH range measured on the board (nominally 3.0 V max at the pin)
 - All trip and clear thresholds
@@ -418,6 +418,57 @@ done once these are filled in:
 
 Response time is within one 1 s frame in both directions (dark -> torch ~3 frames
 while the torch was brought closer; torch -> covered 0 mV in ~3 frames).
+
+## Lamp relay bring-up (`test_lamp`, ahead of WP7)
+
+Goal: lamp ON when ambient light is low, OFF when it is high. Breadboard only.
+The PCB layout (IRLZ44N stage on GPIO15) is decided after this works, and
+`board_profile.h` is unchanged.
+
+Wiring: a TONGLING JQC-3FF-S-Z 5 V "Low Level Trigger" module. VCC to 5 V, GND
+to ESP32 GND. IN through a transistor stage like the PCB: GPIO15 -> 220 Ohm ->
+N-MOSFET gate (or 1 kOhm -> NPN base), 10 kOhm gate/base to GND, source/emitter
+to GND, drain/collector to IN. GPIO15 HIGH = relay ON, so `lamp_main.c` drives
+it active-high (`LAMP_RELAY_ACTIVE_LOW 0`), like `BOARD_RELAY1_ACTIVE_LOW`.
+Light sensor as in `test_light`, on 3.3 V (on 5 V it can exceed GPIO1's range).
+Mains: live (brown) to COM -> NO -> lamp, neutral (blue) straight to the lamp,
+NC empty. Relay off (reset, no USB, battery) = lamp OFF.
+
+Hardware result, 24 Oct 2026 (IN straight to GPIO15, no transistor):
+
+- Module VCC not on a live 5 V read ~2.5 V: GPIO15 back-fed it through IN. Check
+  VCC is about 5 V and the red PWR LED is on before connecting IN.
+- With VCC fixed, covering the sensor (0-4 mV) switched the relay ON after the
+  30 s dwell, but GPIO15 HIGH (3.3 V) never switched it OFF. The module's input
+  is referenced to its 5 V VCC. Direct drive is ruled out for this module.
+- Not yet run with the transistor stage: uncover -> OFF and reset -> OFF.
+
+Test with a low-voltage load on COM/NO first. The 230 V hookup is done with
+the supply unplugged, the module in an enclosure away from the ESP32, earth
+on the fixture if it is metal (the feed cable is 2-core brown/blue), and
+checked by a supervisor before power-on.
+
+```bash
+pio run -e test_lamp -t upload -t monitor
+```
+
+Decision: `domain/lamp_control` (host-tested). ON below `LAMP_ON_BELOW_MV`, OFF
+above `LAMP_OFF_ABOVE_MV`, unchanged in between; each state is held at least
+`LAMP_MIN_ON_MS` / `LAMP_MIN_OFF_MS` (boot counts as a switch to OFF). Saturated
+counts as bright; `LAMP_FAULTS_TO_OFF` bad readings in a row switch OFF at once.
+The 40 / 120 mV, 30 s values are bench placeholders.
+Deliberate bring-up deviation from §10: it acts on uncalibrated mV and does not
+check reading age, so a stalled sensor freezes the last state (possibly ON).
+WP7 must calibrate light or accept relative mV explicitly, and add staleness -> OFF.
+
+Checks: cover the sensor -> ON after the dwell; torch -> OFF after the dwell;
+no chatter inside the band; reset or unplug -> OFF and stays OFF through boot.
+
+Thresholds (not yet measured): the sensor may see the lamp it controls, which
+would switch it off, then on, in a loop. At the final sensor position record
+night lamp OFF, night lamp ON and daylight lamp OFF, and put
+`LAMP_OFF_ABOVE_MV` above "night lamp ON". If that is above daylight, shield
+the sensor from the lamp or point it at the window.
 
 ## HC-SR04 bring-up (WP4)
 

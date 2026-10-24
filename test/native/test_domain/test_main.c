@@ -5,6 +5,7 @@
 #include "board_profile.h"
 #include "domain/calibration.h"
 #include "domain/ds18b20_codec.h"
+#include "domain/lamp_control.h"
 #include "domain/reading.h"
 #include "domain/sgp30_codec.h"
 #include "domain/tds_codec.h"
@@ -217,6 +218,66 @@ static void test_ds18b20_scratchpad_checks(void) {
   TEST_ASSERT_FALSE(ds18b20Is12Bit(0x1F));  // 9-bit
 }
 
+static const LampControlConfig kLampTest = {40.0f, 120.0f, 30000, 30000, 3};
+
+static Reading lampLight(float mv, Health health) {
+  Reading r;
+  readingReset(&r, SENSOR_LIGHT, METRIC_LIGHT_LEVEL, UNIT_MILLIVOLT);
+  r.health = health;
+  r.value = mv;
+  return r;
+}
+
+static void test_lamp_hysteresis_band(void) {
+  LampControl c;
+  lampControlInit(&c, &kLampTest, 0);
+  Reading r = lampLight(80.0f, HEALTH_UNCALIBRATED);  // inside the band: stays OFF
+  TEST_ASSERT_FALSE(lampControlUpdate(&c, &r, 60000));
+  r.value = 39.0f;
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &r, 61000));
+  r.value = 119.0f;  // inside the band: stays ON
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &r, 200000));
+  r.value = 121.0f;
+  TEST_ASSERT_FALSE(lampControlUpdate(&c, &r, 201000));
+}
+
+static void test_lamp_dwell_holds_changes(void) {
+  LampControl c;
+  lampControlInit(&c, &kLampTest, 0);
+  Reading r = lampLight(10.0f, HEALTH_OK);
+  TEST_ASSERT_FALSE(lampControlUpdate(&c, &r, 29999));  // boot counts as OFF
+  TEST_ASSERT_TRUE(c.waiting);
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &r, 30000));
+  TEST_ASSERT_FALSE(c.waiting);
+  r.value = 500.0f;
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &r, 59999));
+  TEST_ASSERT_FALSE(lampControlUpdate(&c, &r, 60000));
+}
+
+static void test_lamp_faults_hold_then_force_off(void) {
+  LampControl c;
+  lampControlInit(&c, &kLampTest, 0);
+  Reading r = lampLight(10.0f, HEALTH_OK);
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &r, 30000));
+  Reading bad = lampLight(0.0f, HEALTH_FAULT);
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &bad, 31000));
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &bad, 32000));
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &r, 33000));  // a good reading resets the count
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &bad, 34000));
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &bad, 35000));
+  TEST_ASSERT_FALSE(lampControlUpdate(&c, &bad, 36000));  // 3rd in a row, no dwell
+}
+
+static void test_lamp_saturated_counts_as_bright(void) {
+  LampControl c;
+  lampControlInit(&c, &kLampTest, 0);
+  Reading r = lampLight(10.0f, HEALTH_OK);
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &r, 30000));
+  r.value = 20.0f;  // a clipped value is only a lower bound
+  r.qualityFlags = kQualitySaturated;
+  TEST_ASSERT_FALSE(lampControlUpdate(&c, &r, 60000));
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -240,5 +301,9 @@ int main(int argc, char** argv) {
   RUN_TEST(test_onewire_crc_matches_maxim_vector);
   RUN_TEST(test_ds18b20_temperature_table);
   RUN_TEST(test_ds18b20_scratchpad_checks);
+  RUN_TEST(test_lamp_hysteresis_band);
+  RUN_TEST(test_lamp_dwell_holds_changes);
+  RUN_TEST(test_lamp_faults_hold_then_force_off);
+  RUN_TEST(test_lamp_saturated_counts_as_bright);
   return UNITY_END();
 }
