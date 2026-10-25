@@ -251,9 +251,9 @@ Hardware results, 25 Oct 2026 (breadboard, sensors in air):
 | `stall_safety` | stall 60.35 s; `sup: safety no progress for 1202 ms` 61.33 s; TWDT names `Safety (CPU 0)` at 65.53 s; reboot `reset reason: TASK_WDT` |
 | Stack free (min, B) | Safety 1348 / 3072 (after its first log call), AcqNormal 2304 / 4096, SerialLogger 896 / 2048, Supervisor 1016 / 3072 (600 before its line buffers were made static) |
 | Heap (internal) | free 342 KB, minimum 337 KB, largest block 303 KB |
+| `alarm_latency` (§19) | **PASS**: 120 TRIPs over 30 s, every BME280 phase. Acquisition submit -> Safety action 37-96 us (avg ~54 us); sample end -> action 1 ms (1 ms clock resolution, so < 2 ms) vs the 10 ms target. `late 0 skip 0 guard 0`, `health OK` throughout. Radios not running yet: repeat under Wi-Fi/BLE load in WP8 (D14) |
 
-Not yet run: alarm latency (`alarm_latency` env built, board run pending);
-hold inside the 40-120 mV band and reset with the lamp ON (need the MOSFET
+Not yet run: hold inside the 40-120 mV band and reset with the lamp ON (need the MOSFET
 stage: the relay module does not release from a 3.3 V GPIO); 24 h endurance
 (not planned for now). Safety's float log path (rule
 TRIP/CLEAR lines) has not executed yet, so its stack figure excludes it.
