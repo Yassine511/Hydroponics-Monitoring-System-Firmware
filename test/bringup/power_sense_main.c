@@ -213,6 +213,15 @@ static void printModeBanner(uint8_t level) {
   printf("  |\n+--------------------------------------------------------+\n");
 }
 
+// "after N ms", or "not reached" for -1.
+static void printAfter(int32_t ms) {
+  if (ms < 0) {
+    printf("not reached");
+  } else {
+    printf("after %ld ms", (long)ms);
+  }
+}
+
 static void printSummary(const Transition* t) {
   bool pass = t->endLevel == (t->rising ? 1 : 0);
   if (t->adcValid) pass = pass && (t->rising ? t->mvAfter >= PS_VIH_MV : t->mvAfter <= PS_VIL_MV);
@@ -234,14 +243,30 @@ static void printSummary(const Transition* t) {
   }
 
   if (t->adcValid && t->rising) {
-    printf("  timing  > %u mV after %ld ms\n", PS_VIH_MV, (long)t->tVihMs);
+    printf("  timing  > %u mV ", PS_VIH_MV);
+    printAfter(t->tVihMs);
+    printf("\n");
   } else if (t->adcValid) {
-    printf("  timing  < %u mV after %ld ms, < %u mV after %ld ms, ~0 V after %ld ms\n",
-           PS_VIH_MV, (long)t->tVihMs, PS_VIL_MV, (long)t->tVilMs, (long)t->tEndMs);
+    printf("  timing  < %u mV ", PS_VIH_MV);
+    printAfter(t->tVihMs);
+    printf(", < %u mV ", PS_VIL_MV);
+    printAfter(t->tVilMs);
+    if (t->tEndMs >= 0) {
+      printf(", ~0 V ");
+      printAfter(t->tEndMs);
+    } else {
+      printf(", settled at %u mV", t->mvAfter);
+    }
+    printf("\n");
   }
 
-  printf("  bounce  %lu edge(s) in %lu.%lu ms", (unsigned long)t->edges,
-         (unsigned long)(t->bounceUs / 1000u), (unsigned long)(t->bounceUs % 1000u / 100u));
+  printf("  bounce  %lu edge(s) in ", (unsigned long)t->edges);
+  if (t->bounceUs < 1000u) {
+    printf("%lu us", (unsigned long)t->bounceUs);
+  } else {
+    printf("%lu.%lu ms", (unsigned long)(t->bounceUs / 1000u),
+           (unsigned long)(t->bounceUs % 1000u / 100u));
+  }
   if (t->bounceUs >= PS_QUALIFY_US) {
     printf("\n  WARNING: longer than the %lu ms qualify window\n",
            (unsigned long)BOARD_POWER_SENSE_QUALIFY_MS);
