@@ -97,7 +97,8 @@ typedef struct Transition {
   int32_t tVihMs, tVilMs, tEndMs;  // from ADC departure; -1 = not reached
   uint16_t flipMinMv, flipMaxMv;   // ADC value where the sampler saw GPIO flip
   bool timedOut;
-  bool dip;  // ADC excursion that recovered with no GPIO edge
+  bool dip;     // ADC excursion that recovered with no GPIO edge
+  bool outage;  // GPIO left its level and came back before the pin settled
 } Transition;
 
 static Sample s_samples[PS_SAMPLE_RING];
@@ -340,6 +341,33 @@ static void reportTransition(Transition* t, const Edge* edges, uint32_t nListed,
     return;
   }
 
+  // GPIO edges but the pin ended in the band it started in: power went away
+  // and came back (or the reverse) before the pin settled. The mode banners
+  // already showed both changes; report it as one short outage, no verdict.
+  if (t->adcValid && t->edges > 0 && !t->timedOut &&
+      strcmp(bandName(t->mvBefore), bandName(t->mvAfter)) == 0) {
+    const bool wasHigh = t->mvBefore >= PS_VIH_MV;
+    uint32_t extreme = wasHigh ? 0xFFFFu : 0u;
+    int32_t leftMs = -1, backMs = -1;
+    for (uint32_t i = sampleIndexAt(departUs, last); i < last; ++i) {
+      const Sample* s = sampleAt(i);
+      const bool inBand = wasHigh ? s->mv >= PS_VIH_MV : s->mv <= PS_VIL_MV;
+      if (wasHigh ? s->mv < extreme : s->mv > extreme) extreme = s->mv;
+      if (leftMs < 0 && !inBand) leftMs = msSince(departUs, s->tUs);
+      if (leftMs >= 0 && backMs < 0 && inBand) backMs = msSince(departUs, s->tUs);
+    }
+    printf("  result  short %s: pin %s for %ld ms (down to %lu mV), GPIO back to %u   OK\n",
+           wasHigh ? "outage" : "power blip", wasHigh ? "left HIGH" : "left LOW",
+           (leftMs >= 0 && backMs >= 0) ? (long)(backMs - leftMs) : -1L,
+           (unsigned long)extreme, t->endLevel);
+    printf("  bounce  %lu edge(s) over both changes\n", (unsigned long)t->edges);
+    t->outage = true;
+    t->tEndMs = backMs;
+    s_history[s_historyCount % PS_HISTORY] = *t;
+    s_historyCount++;
+    return;
+  }
+
   printSummary(t);
   if (s_verbose) {
     if (t->adcValid && t->flipMaxMv > 0) {
@@ -370,7 +398,7 @@ static void printTable(void) {
   for (uint32_t k = from; k < s_historyCount; ++k) {
     const Transition* t = &s_history[k % PS_HISTORY];
     printf("%3lu  %s  %5lu  %9.3f  %9u  %8u  %5ld  %5ld  %5ld  %4u  %u-%u%s\n",
-           (unsigned long)(k + 1u), t->dip ? "DIP " : t->rising ? "RISE" : "FALL",
+           (unsigned long)(k + 1u), t->dip ? "DIP " : t->outage ? "OUT " : t->rising ? "RISE" : "FALL",
            (unsigned long)t->edges,
            (double)t->bounceUs / 1000.0, t->mvBefore, t->mvAfter, (long)t->tVihMs,
            (long)t->tVilMs, (long)t->tEndMs, t->endLevel,

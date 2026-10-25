@@ -473,6 +473,10 @@ the PC USB). 6 power losses, 5 power-ons and 1 contact dip, over two runs:
   must also reject readings that finished just before it.
 - Unplugging can make contact bounce (an ADC dip with no GPIO edge). The digital
   input ignores it.
+- A quick unplug/replug (~0.4 s, pin below 825 mV and back) gave LOW-POWER then
+  NORMAL 0.37 s apart, both correctly qualified. WP9 should expect such
+  back-to-back transitions; returning to NORMAL also needs the 5 V branch
+  settle time before the 5 V sensors are read.
 - The HIGH ceiling (<= 3.6 V) was not measured (no multimeter, ADC clipped):
   4.75-5.25 V x 440/660 = 3.17-3.50 V by calculation.
 - The ADC and the GPIO input coexist on GPIO8 (`isr ok`, `mismatch 0`;
