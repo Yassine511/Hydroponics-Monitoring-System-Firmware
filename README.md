@@ -22,8 +22,9 @@
 GPIO35-37 are used by the PSRAM; GPIO0, 3, 45 and 46 are strapping pins.
 
 > `include/board_profile.h` matches this table (remapped 22 Oct 2026).
-> `BOARD_POWER_SENSE_VERIFIED` stays `false`, so the build reports non-production
-> until GPIO8 is measured on the board. The MQ-7 code is gone: `SENSOR_MQ7` and
+> `BOARD_POWER_SENSE_VERIFIED` is `true` since 25 Oct 2026 (GPIO8 measured with
+> `test_power_sense`, see "External-power sense bring-up"); WP9 must apply
+> `BOARD_POWER_SENSE_QUALIFY_MS`. The MQ-7 code is gone: `SENSOR_MQ7` and
 > `METRIC_CO_SIGNAL` became `SENSOR_SGP30`, `METRIC_TVOC` and `METRIC_CO2EQ`
 > (`Snapshot` 528 -> 584 bytes), and `drivers/mq7.*` became the `drivers/sgp30.*`
 > stub with its own `test_sgp30` env.
@@ -133,7 +134,7 @@ To change one, open a short review with the team lead. Do not edit them inside a
 | WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `domain/sgp30_codec.*`, `hal/i2c_bus.*` (raw write/read), `test/bringup/sgp30_main.c`, `test/bringup/climate_main.c` | 2 | — (**running on S3 hardware 22 Oct 2026: feature set 0x0020 @0x58, 1 s cadence, 13 ms per measurement, no CRC faults; breath and hand-sanitiser spikes seen. Runs with the BME280 on the shared bus in `test_climate`, with humidity compensation. Baseline save/restore, 12 h learning and fault recovery not yet tested**; baseline is RAM-only until WP8 stores it in NVS) |
 | WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*` | 4 | ≥1 working driver; thresholds |
 | WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*` | 5 | WP7 snapshot |
-| WP9 | Power ISR, rail epoch, lease handover | `services/power_coordinator.*`, `services/rail_state.*` | 6 | power sense on GPIO8 measured on the board |
+| WP9 | Power ISR, rail epoch, lease handover | `services/power_coordinator.*`, `services/rail_state.*` | 6 | — (power sense on GPIO8 measured 25 Oct 2026; ISR must self-disable + 20 ms qualification) |
 | WP10 | Logger queue, supervisor, watchdogs | `diagnostics/*`, `services/supervisor.*` | 4 | — |
 
 WP2, WP3, WP6 and WP10 can start in parallel. A driver counts as done when it meets the "Completion evidence" column of the §16 table. Compiling is not enough.
@@ -143,7 +144,7 @@ WP2, WP3, WP6 and WP10 can start in parallel. A driver counts as done when it me
 The pins below are now on the drawing, but their behaviour must be measured on
 the board before the matching feature is switched on. Do not guess the open items in code.
 
-- External-power sense on GPIO8: actual levels at the real USB voltage (~3.33 V at 5.00 V, ~3.5 V at 5.25 V), decay and bounce. The divider has no hysteresis.
+- External-power sense on GPIO8: **measured 25 Oct 2026** (`test_power_sense`): levels, decay and bounce pass; flag set. Open: HIGH ceiling by calculation only, loaded rail, slow pull. The divider has no hysteresis, so WP9 qualifies edges for 20 ms.
 - Per-branch 5 V rail feedback: not on the drawing; use measured settle timing.
 - Relay on GPIO15 (active-high, IRLZ44N): which contact (NO/NC) is used, the driven load and its safe state. Breadboard answer (`test_lamp`): grow lamp on NO, de-energised = lamp OFF; PCB still pending.
 - SGP30 module: 3.3 V supply and logic levels, pull-ups, baseline storage policy.
@@ -418,6 +419,65 @@ done once these are filled in:
 
 Response time is within one 1 s frame in both directions (dark -> torch ~3 frames
 while the torch was brought closer; torch -> covered 0 mV in ~3 frames).
+
+## External-power sense bring-up (`test_power_sense`, WP9 gate)
+
+Goal: measure what decides `BOARD_POWER_SENSE_VERIFIED`. The levels at GPIO8
+with USB in and out, how long the pin decays through the undefined band, and how
+many edges each plug or unplug gives. The divider has no hysteresis.
+`power_sense_main.c` timestamps every GPIO8 edge from a CHANGE interrupt (us)
+and samples ADC1_CH7 at 1 kHz. Once the level has been stable for
+`BOARD_POWER_SENSE_QUALIFY_MS` (20 ms) it prints a `MODE: NORMAL` /
+`MODE: LOW-POWER` banner, as the WP9 power task will decide. When the pin has
+settled, three indented lines follow: result (PASS/FAIL), timing and bounce. A
+heartbeat repeats the mode every 30 s. `v` shows each edge, `d` prints the
+table of all transitions.
+
+The ADC is set up once through the IDF driver. `analogReadMilliVolts()` must not
+be used on a pin that also needs its digital input: every call runs
+`pinMode(pin, ANALOG)`, which disables the input buffer. The test checks that
+both paths still agree and prints a `WARNING` line when they do not (ISR deaf,
+GPIO/ADC mismatch); then press `a` for digital-only mode. The ADC clips at ~3050 mV, so the high
+level (~3.33 V) needs a multimeter at GPIO8: >= 2.475 V and <= 3.6 V.
+
+Pass criteria, all needed before the flag goes true: multimeter HIGH in
+2.475-3.6 V; steady LOW max <= 825 mV; every RISE/FALL settles at the right GPIO
+level; the edge count and bounce span per transition are recorded (more than
+one edge means the power ISR needs a qualification window); and the decay time is known.
+
+```bash
+pio run -e test_power_sense -t upload -t monitor
+```
+
+The env opens the monitor with DTR/RTS released, so reopening it after an
+unplug does not reset the board and the transition history survives.
+
+Hardware result, 25 Oct 2026 (breadboard; power bank on the + rail, ESP32 on
+the PC USB). 6 power losses, 5 power-ons and 1 contact dip, over two runs:
+
+| | Power lost (FALL) | Power on (RISE) |
+|---|---|---|
+| Settled GPIO level | 0 every time | 1 every time |
+| Settled ADC | 0-53 mV (<= 825 mV) | 3157 mV, clipped (>= 2475 mV) |
+| Edges / bounce span | 479-928 edges over 5.0-14.0 ms, gaps down to 1 us | 3-16 edges over 0.03-0.2 ms |
+| Real switching point (ADC at the flip) | ~1650 mV | ~1930-1990 mV |
+| Below VIH -> below VIL | 26-181 ms -> 300-453 ms after departure (band ~272 ms) | above VIH 2-4 ms, clip 14-15 ms |
+| First GPIO edge after departure | 59-220 ms (+ rail already ~2.5 V) | < 1 ms |
+
+- The divider without hysteresis chatters through ~1.65 V, giving up to ~930
+  interrupts in 14 ms. The WP9 power ISR must disable itself on the first edge
+  and let the power task re-read the level after a qualification window
+  (>= 20 ms suggested, longer than the 14 ms worst case seen), then re-arm.
+- The edge arrives when the 5 V branch is already down to ~2.5 V. 5 V readings
+  started in the ~60-220 ms before the edge can be invalid, so the rail epoch
+  must also reject readings that finished just before it.
+- Unplugging can make contact bounce (an ADC dip with no GPIO edge). The digital
+  input ignores it.
+- The HIGH ceiling (<= 3.6 V) was not measured (no multimeter, ADC clipped):
+  4.75-5.25 V x 440/660 = 3.17-3.50 V by calculation.
+- The ADC and the GPIO input coexist on GPIO8 (`isr ok`, `mismatch 0`;
+  1 `adc-disturbed` in the chatter of one transition).
+- Not covered: the + rail under sensor load, a slow cable pull, the power bank's own button.
 
 ## Lamp relay bring-up (`test_lamp`, ahead of WP7)
 

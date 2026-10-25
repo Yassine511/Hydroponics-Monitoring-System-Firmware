@@ -64,9 +64,17 @@ enum {
 #define BOARD_PIN_EXTERNAL_POWER_SENSE ((int8_t)8)
 #define BOARD_POWER_SENSE_DIVIDER_TOP_OHM ((uint32_t)220)
 #define BOARD_POWER_SENSE_DIVIDER_BOTTOM_OHM ((uint32_t)440)
-// Levels, decay and bounce not yet measured on the board (§13, §20). Keep false
-// until they are; power transitions and production status stay disabled.
-#define BOARD_POWER_SENSE_VERIFIED false
+// Measured 25 Oct 2026 with test_power_sense (breadboard, 6 losses / 5 power-ons,
+// README "External-power sense bring-up"): LOW 0-53 mV, HIGH >= 3.05 V (ADC
+// clipped; <= 3.6 V by calculation only, 3.17-3.50 V for a 4.75-5.25 V supply).
+// Switches at ~1.65 V falling / ~1.95 V rising. Power loss chatters 479-928
+// edges over 5-14 ms; power-on 3-16 edges over < 0.2 ms. First falling edge
+// 59-220 ms after the rail starts to drop (+ rail already ~2.5 V).
+// Requirements on WP9: the ISR disables itself on the first edge and the power
+// task re-reads the level after BOARD_POWER_SENSE_QUALIFY_MS before acting and
+// re-arming; the rail epoch also rejects 5 V readings that ended just before it.
+#define BOARD_POWER_SENSE_VERIFIED true
+#define BOARD_POWER_SENSE_QUALIFY_MS ((uint32_t)20)
 
 // ---- Relay 1 (SRD-05VDC, coil on external 5 V) -------------------------------
 // GPIO15 -> 220 Ohm -> IRLZ44N gate (low side), 10 kOhm gate pull-down,
