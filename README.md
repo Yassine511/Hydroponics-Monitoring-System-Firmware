@@ -473,10 +473,16 @@ the PC USB). 6 power losses, 5 power-ons and 1 contact dip, over two runs:
   must also reject readings that finished just before it.
 - Unplugging can make contact bounce (an ADC dip with no GPIO edge). The digital
   input ignores it.
-- A quick unplug/replug (~0.4 s, pin below 825 mV and back) gave LOW-POWER then
-  NORMAL 0.37 s apart, both correctly qualified. WP9 should expect such
-  back-to-back transitions; returning to NORMAL also needs the 5 V branch
-  settle time before the 5 V sensors are read.
+- A ~0.4 s cut of the 5 V (pin below 825 mV and back, most likely the power
+  bank switching its output off and on by itself, not a manual replug) gave
+  LOW-POWER then NORMAL 0.37 s apart, both correctly qualified. WP9 should
+  expect such back-to-back transitions; returning to NORMAL also needs the 5 V
+  branch settle time before the 5 V sensors are read.
+- Power banks with an auto-off timer or low-load cut-off can drop the 5 V on
+  their own, and the firmware then (correctly) goes LOW-POWER. A bank shutting
+  down also decays more slowly at first (210 ms to below VIH, 780 ms to below
+  VIL, against 26-181 / 300-453 ms for a pulled cable). If the field supply
+  is a power bank, choose one with an always-on / low-current mode.
 - The HIGH ceiling (<= 3.6 V) was not measured (no multimeter, ADC clipped):
   4.75-5.25 V x 440/660 = 3.17-3.50 V by calculation.
 - The ADC and the GPIO input coexist on GPIO8 (`isr ok`, `mismatch 0`;
