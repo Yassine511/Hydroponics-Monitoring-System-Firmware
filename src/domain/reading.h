@@ -40,7 +40,7 @@ typedef struct Reading {
   int32_t raw;                // ADC counts / mV / raw register value if hasRaw
   MonoMs intervalStartMs;     // acquisition interval
   MonoMs intervalEndMs;
-  MonoMs lastGoodMs;          // 0 = never
+  MonoMs lastGoodMs;          // last usable result (OK or UNCALIBRATED); 0 = never
   uint32_t sequence;          // per-metric sample counter
   uint32_t powerEpoch;        // rail epoch when measured (§12)
   uint16_t configRevision;

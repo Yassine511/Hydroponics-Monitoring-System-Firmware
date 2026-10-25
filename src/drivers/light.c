@@ -92,6 +92,7 @@ static PollResult finish(LightDriver* self, MonoMs now) {
   r->unit = UNIT_MILLIVOLT;
   r->value = pinMv;  // no divider: pin mV = module mV
   r->health = HEALTH_UNCALIBRATED;  // no lux mapping until a reference meter (D13)
+  r->lastGoodMs = now;  // last usable result (OK or UNCALIBRATED)
   ++r->sequence;
   PollResult pr = {DRIVER_READY, now};
   return pr;

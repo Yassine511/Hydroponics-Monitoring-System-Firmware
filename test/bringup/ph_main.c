@@ -37,7 +37,7 @@ static AdcChannel s_adc = ADC_CHANNEL_INIT;
 static PhConfig s_config = {&s_adc, BOARD_PH_DIVIDER_TOP_OHM, BOARD_PH_DIVIDER_BOTTOM_OHM,
                             {1.0f, 0.0f, 0, false}, false};  // set in setup()
 static PhDriver s_driver;
-static BringupContext s_ctx = {&s_driver.base, CFG_FRAME_PERIOD_MS};
+static BringupContext s_ctx = {&s_driver.base, CFG_FRAME_PERIOD_MS, NULL};
 
 void setup(void) {
   if (PH_BUFFER_A_MV > 0.0f && PH_BUFFER_B_MV > 0.0f) {

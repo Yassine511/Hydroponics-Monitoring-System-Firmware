@@ -27,7 +27,7 @@
 static PulseCapture s_capture = PULSE_CAPTURE_INIT;
 static Hcsr04Config s_config = {&s_capture, CFG_HCSR04_TIMEOUT_MS};
 static Hcsr04Driver s_driver;
-static BringupContext s_ctx = {&s_driver.base, CFG_FRAME_PERIOD_MS};
+static BringupContext s_ctx = {&s_driver.base, CFG_FRAME_PERIOD_MS, NULL};
 
 void setup(void) {
   hcsr04DriverConstruct(&s_driver, &s_config);

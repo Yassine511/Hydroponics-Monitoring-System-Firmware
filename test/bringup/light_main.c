@@ -23,7 +23,7 @@
 static AdcChannel s_adc = ADC_CHANNEL_INIT;
 static LightConfig s_config = {&s_adc};
 static LightDriver s_driver;
-static BringupContext s_ctx = {&s_driver.base, CFG_FRAME_PERIOD_MS};
+static BringupContext s_ctx = {&s_driver.base, CFG_FRAME_PERIOD_MS, NULL};
 
 void setup(void) {
   lightDriverConstruct(&s_driver, &s_config);

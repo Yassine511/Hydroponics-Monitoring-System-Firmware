@@ -1,9 +1,9 @@
 // PowerCoordinator: power-mode state machine and acquisition lease owner.
 // Work package WP9 (Stage 6). Architecture §11, §12.
 //
-// Gate: the external-power-present GPIO is unassigned (board_profile.h).
-// Until it is commissioned, bench builds run in Normal and report
-// productionReady = false.
+// Power sense: GPIO8, measured 25 Oct 2026 (BOARD_POWER_SENSE_VERIFIED). The
+// ISR must disable itself on the first edge and the task must re-read the
+// level after BOARD_POWER_SENSE_QUALIFY_MS (board_profile.h).
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>

@@ -13,6 +13,17 @@ static inline Ds18b20Driver* asDs18b20(SensorDriver* d) { return (Ds18b20Driver*
 
 static void finish(Ds18b20Driver* self, const uint8_t sp[DS18B20_SCRATCHPAD_LEN], MonoMs now);
 
+// No presence pulse: publish a FAULT verdict, as the other drivers do, so the
+// last OK reading is not served as current. lastGoodMs keeps its value.
+static void markNotPresent(Ds18b20Driver* self, MonoMs start, MonoMs now) {
+  Reading* r = &self->result_;
+  r->intervalStartMs = start;
+  r->intervalEndMs = now;
+  r->qualityFlags = kQualityNone;
+  r->hasRaw = false;
+  r->health = HEALTH_FAULT;
+}
+
 static SensorId ds18b20Id(const SensorDriver* d) { (void)d; return SENSOR_DS18B20; }
 static const char* ds18b20Name(const SensorDriver* d) { (void)d; return "ds18b20"; }
 static uint8_t ds18b20MetricCount(const SensorDriver* d) { (void)d; return 1; }
@@ -70,6 +81,7 @@ static DriverStatus ds18b20Start(SensorDriver* d, MonoMs now) {
   if (!self->initialised_) return DRIVER_FAULT;
   if (!selectDevice(self)) {
     self->initialised_ = false;
+    markNotPresent(self, now, now);
     return DRIVER_NOT_PRESENT;
   }
   oneWireBusWriteByte(self->config_.bus, kCmdConvertT);
@@ -94,6 +106,7 @@ static PollResult ds18b20Poll(SensorDriver* d, MonoMs now) {
   uint8_t sp[DS18B20_SCRATCHPAD_LEN];
   if (!readScratchpad(self, sp)) {
     self->initialised_ = false;
+    markNotPresent(self, self->startMs_, now);
     r.status = DRIVER_NOT_PRESENT;
     return r;
   }

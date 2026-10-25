@@ -119,12 +119,12 @@ static PollResult finish(TdsDriver* self, MonoMs now) {
     return pr;
   }
   ++r->sequence;
+  r->lastGoodMs = now;  // last usable result (OK or UNCALIBRATED)
   if (!cfg->calibration.valid) {  // nominal datasheet curve, no reference check (D13)
     r->health = HEALTH_UNCALIBRATED;
     return pr;
   }
   r->health = HEALTH_OK;
-  r->lastGoodMs = now;
   return pr;
 }
 

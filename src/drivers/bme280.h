@@ -14,7 +14,8 @@
 //   others    no bus access
 // Any bus fault, timeout or invalid sample clears the initialised state, so
 // the next start() returns Fault and the caller re-runs init(). poll() also
-// detects a module power-cycle (ctrl_hum back to reset 0) and re-inits.
+// detects a module power-cycle (ctrl_hum back to reset 0): it fails the
+// sample and clears the initialised state; the caller then re-runs init().
 //
 // Implements the SensorDriver contract in drivers/sensor_driver.h.
 #pragma once

@@ -1,6 +1,7 @@
 #include "hal/i2c_bus.h"
 
 #include <Arduino.h>
+#include <driver/gpio.h>
 #include <esp32-hal-i2c.h>
 
 // Controller 0 (what the C++ version reached through the Arduino `Wire`
@@ -56,6 +57,10 @@ bool i2cBusRecover(I2cBus* bus) {
   const int8_t sda = bus->sda_;
   const int8_t scl = bus->scl_;
   if (sda < 0 || scl < 0) return false;
+  // An idle bus has SDA high: the failure was a NACK (e.g. a device that is
+  // absent or busy), not a stuck bus. Leave the controller running so the
+  // other device on the bus is not disturbed (audit L5).
+  if (bus->started_ && gpio_get_level((gpio_num_t)sda) != 0) return true;
   if (bus->started_) i2cBusEnd(bus);
 
   pinMode(sda, INPUT_PULLUP);

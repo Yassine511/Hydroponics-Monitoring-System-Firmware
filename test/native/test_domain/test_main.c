@@ -2,11 +2,15 @@
 // Domain code must stay free of Arduino/FreeRTOS so these run on a PC.
 #include <unity.h>
 
+#include "app_config.h"
 #include "board_profile.h"
+#include "domain/alarm.h"
 #include "domain/calibration.h"
 #include "domain/ds18b20_codec.h"
 #include "domain/lamp_control.h"
 #include "domain/reading.h"
+#include "domain/safety_core.h"
+#include "domain/schedule.h"
 #include "domain/sgp30_codec.h"
 #include "domain/tds_codec.h"
 #include "domain/ultrasonic.h"
@@ -92,7 +96,34 @@ static void test_snapshot_reset_indexes_by_metric(void) {
 
 static void test_production_ready_requires_power_sense(void) {
   BoardValidation v = boardProfileValidate();
-  if (!v.powerSenseAssigned || !BOARD_POWER_SENSE_VERIFIED) TEST_ASSERT_FALSE(v.productionReady);
+  TEST_ASSERT_EQUAL(v.powerSenseAssigned && BOARD_POWER_SENSE_VERIFIED, v.productionReady);
+}
+
+static void test_snapshot_reset_sets_identity(void) {
+  Snapshot s;
+  snapshotReset(&s);
+  TEST_ASSERT_EQUAL_UINT8(SENSOR_BME280, s.readings[METRIC_AIR_HUMIDITY].sensor);
+  TEST_ASSERT_EQUAL_UINT8(UNIT_PERCENT_RH, s.readings[METRIC_AIR_HUMIDITY].unit);
+  TEST_ASSERT_EQUAL_UINT8(SENSOR_DS18B20, s.readings[METRIC_WATER_TEMPERATURE].sensor);
+  TEST_ASSERT_EQUAL_UINT8(SENSOR_LIGHT, s.readings[METRIC_LIGHT_LEVEL].sensor);
+  TEST_ASSERT_EQUAL_UINT8(SENSOR_SGP30, s.readings[METRIC_CO2EQ].sensor);
+  TEST_ASSERT_EQUAL_UINT8(UNIT_PPB, s.readings[METRIC_TVOC].unit);
+  for (uint8_t i = 0; i < METRIC_COUNT; ++i) {
+    TEST_ASSERT_TRUE(s.readings[i].sensor < SENSOR_COUNT);
+  }
+}
+
+static void test_alarm_rule_ignores_stale_sample(void) {
+  AlarmRule rule = {0};
+  rule.metric = METRIC_AIR_TEMPERATURE;
+  AlarmRuleState state = {0};
+  Reading r;
+  readingReset(&r, SENSOR_BME280, METRIC_AIR_TEMPERATURE, UNIT_DEG_C);
+  r.health = HEALTH_OK;
+  r.value = 50.0f;
+  r.intervalEndMs = 1000;
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NOT_ELIGIBLE, evaluateRule(&rule, &r, 2001, 1000, &state));
+  TEST_ASSERT_TRUE(evaluateRule(&rule, &r, 1500, 1000, &state) != RULE_DECISION_NOT_ELIGIBLE);
 }
 
 static void test_sgp30_crc_matches_datasheet_vector(void) {
@@ -278,6 +309,298 @@ static void test_lamp_saturated_counts_as_bright(void) {
   TEST_ASSERT_FALSE(lampControlUpdate(&c, &r, 60000));
 }
 
+// ---- alarm rules (§12) --------------------------------------------------------
+
+static const AlarmRule kHotRule = {.ruleId = 0, .enabled = true, .metric = METRIC_AIR_TEMPERATURE,
+                                   .comparison = COMPARISON_ABOVE, .tripThreshold = 40.0f,
+                                   .clearThreshold = 37.0f, .persistMs = 0,
+                                   .severity = SEVERITY_CRITICAL, .latching = true,
+                                   .actuatorId = ACTUATOR_RELAY1,
+                                   .action = ACTUATOR_ACTION_DEENERGIZE};
+
+static Reading airTemp(float degC, MonoMs endMs) {
+  Reading r;
+  readingReset(&r, SENSOR_BME280, METRIC_AIR_TEMPERATURE, UNIT_DEG_C);
+  r.health = HEALTH_OK;
+  r.value = degC;
+  r.intervalEndMs = endMs;
+  return r;
+}
+
+static RuleDecision evalAt(const AlarmRule* rule, float v, MonoMs t, AlarmRuleState* st) {
+  Reading r = airTemp(v, t);
+  return evaluateRule(rule, &r, t, 1000, st);
+}
+
+static void test_alarm_trips_on_one_sample_and_clears_with_hysteresis(void) {
+  AlarmRuleState st = {0};
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&kHotRule, 39.9f, 250, &st));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_TRIP, evalAt(&kHotRule, 40.0f, 500, &st));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&kHotRule, 45.0f, 750, &st));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&kHotRule, 38.0f, 1000, &st));  // in band
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_CLEAR, evalAt(&kHotRule, 37.0f, 1250, &st));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&kHotRule, 39.0f, 1500, &st));  // no chatter
+}
+
+static void test_alarm_persistence_needs_sustained_valid_samples(void) {
+  AlarmRule rule = kHotRule;
+  rule.persistMs = 1000;
+  AlarmRuleState st = {0};
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&rule, 41.0f, 1000, &st));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&rule, 41.0f, 1999, &st));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_TRIP, evalAt(&rule, 41.0f, 2000, &st));
+
+  AlarmRuleState st2 = {0};
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&rule, 41.0f, 1000, &st2));
+  Reading bad = airTemp(41.0f, 1500);
+  bad.health = HEALTH_FAULT;  // a gap restarts the window
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NOT_ELIGIBLE, evaluateRule(&rule, &bad, 1500, 1000, &st2));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&rule, 41.0f, 2000, &st2));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_TRIP, evalAt(&rule, 41.0f, 3000, &st2));
+}
+
+static void test_alarm_below_rule_mirrors_above(void) {
+  AlarmRule rule = kHotRule;
+  rule.comparison = COMPARISON_BELOW;
+  rule.tripThreshold = 5.0f;
+  rule.clearThreshold = 8.0f;
+  AlarmRuleState st = {0};
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_TRIP, evalAt(&rule, 4.0f, 100, &st));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_NO_CHANGE, evalAt(&rule, 7.0f, 200, &st));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_CLEAR, evalAt(&rule, 8.5f, 300, &st));
+}
+
+static void test_alarm_stale_limits_per_metric(void) {
+  TEST_ASSERT_EQUAL_UINT32(CFG_STALE_BME280_MS, alarmStaleLimitMs(METRIC_AIR_HUMIDITY));
+  TEST_ASSERT_EQUAL_UINT32(CFG_STALE_ORDINARY_MS, alarmStaleLimitMs(METRIC_LIGHT_LEVEL));
+  TEST_ASSERT_EQUAL_UINT32(CFG_STALE_ORDINARY_MS, alarmStaleLimitMs(METRIC_TVOC));
+}
+
+// ---- schedule (§9) ----------------------------------------------------------
+
+static void test_schedule_bme280_runs_four_times_per_frame(void) {
+  ScheduleJob jobs[2];
+  scheduleJobInit(&jobs[0], CFG_FRAME_PERIOD_MS, 20, 0);
+  scheduleJobInit(&jobs[1], CFG_BME280_PERIOD_MS, CFG_BME280_BUDGET_MS, 0);
+  uint32_t frameRuns = 0, bmeRuns = 0;
+  MonoMs now = 0;
+  while (now < 1000) {
+    if (scheduleJobDue(&jobs[0], now)) { scheduleJobMarkRun(&jobs[0], now); ++frameRuns; }
+    if (scheduleJobDue(&jobs[1], now)) { scheduleJobMarkRun(&jobs[1], now); ++bmeRuns; }
+    now = scheduleEarliestDue(jobs, 2);
+  }
+  TEST_ASSERT_EQUAL_UINT32(1, frameRuns);
+  TEST_ASSERT_EQUAL_UINT32(4, bmeRuns);
+  TEST_ASSERT_EQUAL_UINT32(0, jobs[1].late);
+  TEST_ASSERT_TRUE(jobs[1].nextDueMs == 1000);
+}
+
+static void test_schedule_skips_missed_slots_without_burst(void) {
+  ScheduleJob j;
+  scheduleJobInit(&j, 250, 12, 500);
+  scheduleJobMarkRun(&j, 530);  // 30 ms late: keeps the 250 ms grid
+  TEST_ASSERT_TRUE(j.nextDueMs == 750);
+  TEST_ASSERT_EQUAL_UINT32(1, j.late);
+  TEST_ASSERT_EQUAL_UINT32(0, j.skipped);
+  TEST_ASSERT_EQUAL_UINT32(30, j.maxLateMs);
+
+  scheduleJobMarkRun(&j, 3760);  // stalled ~3 s: one run, the rest skipped
+  TEST_ASSERT_TRUE(j.nextDueMs == 4000);
+  TEST_ASSERT_EQUAL_UINT32(12, j.skipped);
+  TEST_ASSERT_FALSE(scheduleJobDue(&j, 3761));
+  TEST_ASSERT_EQUAL_UINT32(2, j.runs);
+}
+
+static void test_schedule_jitter_within_tolerance_is_not_late(void) {
+  ScheduleJob j;
+  scheduleJobInit(&j, 1000, 10, 1000);
+  scheduleJobMarkRun(&j, 1000 + SCHEDULE_LATE_TOLERANCE_MS);
+  TEST_ASSERT_EQUAL_UINT32(0, j.late);
+  TEST_ASSERT_EQUAL_UINT32(SCHEDULE_LATE_TOLERANCE_MS, j.lastLateMs);
+  TEST_ASSERT_TRUE(j.nextDueMs == 2000);
+}
+
+static void test_schedule_defers_step_crossing_bme280_slot(void) {
+  TEST_ASSERT_FALSE(scheduleFitsBefore(230, 50, 250));  // DS18B20 init ~50 ms
+  TEST_ASSERT_TRUE(scheduleFitsBefore(230, 19, 250));
+  TEST_ASSERT_TRUE(scheduleFitsBefore(262, 50, 500));
+}
+
+// ---- safety core (§12) ------------------------------------------------------
+
+static const SafetyConfig kSafetyTest = {true, {40.0f, 120.0f, 30000, 30000, 3}, 3000};
+
+static void setLight(Snapshot* s, float mv, Health h, MonoMs endMs) {
+  Reading* r = &s->readings[METRIC_LIGHT_LEVEL];
+  r->health = h;
+  r->value = mv;
+  r->intervalEndMs = endMs;
+  ++r->sequence;
+}
+
+static SafetyOutputs step(SafetyCore* c, const Snapshot* s, MonoMs now, const AlarmEvent* ev,
+                          uint8_t n) {
+  SafetyInputs in = {s, ev, n, now};
+  SafetyOutputs out;
+  safetyCoreStep(c, &in, &out);
+  return out;
+}
+
+// Dark from t=1 s, one light result per second; returns the core at t=31 s
+// with the lamp ON (boot dwell 30 s).
+static void lampOnAt31s(SafetyCore* c, Snapshot* s, const AlarmRule* rules, uint8_t n) {
+  safetyCoreInit(c, &kSafetyTest, rules, n, 0);
+  snapshotReset(s);
+  for (MonoMs t = 1000; t <= 31000; t += 1000) {
+    setLight(s, 10.0f, HEALTH_UNCALIBRATED, t);
+    step(c, s, t, NULL, 0);
+  }
+}
+
+static void test_safety_boot_off_until_data_and_dwell(void) {
+  SafetyCore c;
+  safetyCoreInit(&c, &kSafetyTest, NULL, 0, 0);
+  SafetyOutputs o = step(&c, NULL, 100, NULL, 0);
+  TEST_ASSERT_FALSE(o.relayOn);
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_NO_DATA, o.lampReason);
+
+  Snapshot s;
+  snapshotReset(&s);
+  o = step(&c, &s, 200, NULL, 0);  // published, but no light result yet
+  TEST_ASSERT_FALSE(o.relayOn);
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_NO_DATA, o.lampReason);
+
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 1000);  // dark, boot dwell running
+  o = step(&c, &s, 1000, NULL, 0);
+  TEST_ASSERT_FALSE(o.relayOn);
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_DWELL, o.lampReason);
+}
+
+static void test_safety_dark_turns_lamp_on_after_dwell(void) {
+  SafetyCore c;
+  Snapshot s;
+  lampOnAt31s(&c, &s, NULL, 0);
+  SafetyOutputs o = step(&c, &s, 31100, NULL, 0);
+  TEST_ASSERT_TRUE(o.relayOn);
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_LEVEL, o.lampReason);
+}
+
+static void test_safety_stale_light_forces_off_without_new_sample(void) {  // audit B1
+  SafetyCore c;
+  Snapshot s;
+  lampOnAt31s(&c, &s, NULL, 0);
+  // Acquisition stalls: the snapshot keeps the reading that ended at 31 s.
+  TEST_ASSERT_TRUE(step(&c, &s, 33900, NULL, 0).relayOn);
+  TEST_ASSERT_TRUE(step(&c, &s, 34000, NULL, 0).relayOn);  // exactly 3 s: still fresh
+  SafetyOutputs o = step(&c, &s, 34100, NULL, 0);
+  TEST_ASSERT_FALSE(o.relayOn);
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_STALE, o.lampReason);
+  // Data resumes, still dark: the OFF dwell started at the forced OFF.
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 35000);
+  TEST_ASSERT_FALSE(step(&c, &s, 35000, NULL, 0).relayOn);
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 64100);
+  TEST_ASSERT_TRUE(step(&c, &s, 64100, NULL, 0).relayOn);
+}
+
+static void test_safety_faults_count_per_result_not_per_wake(void) {
+  SafetyCore c;
+  Snapshot s;
+  lampOnAt31s(&c, &s, NULL, 0);
+  setLight(&s, 0.0f, HEALTH_FAULT, 32000);
+  for (MonoMs t = 32000; t < 33000; t += 100) {  // ten wakes, one FAULT result
+    TEST_ASSERT_TRUE(step(&c, &s, t, NULL, 0).relayOn);
+  }
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_FAULT, step(&c, &s, 33000, NULL, 0).lampReason);
+  setLight(&s, 0.0f, HEALTH_FAULT, 33000);
+  TEST_ASSERT_TRUE(step(&c, &s, 33000, NULL, 0).relayOn);
+  setLight(&s, 0.0f, HEALTH_FAULT, 34000);  // third in a row (faultsToOff = 3)
+  TEST_ASSERT_FALSE(step(&c, &s, 34000, NULL, 0).relayOn);
+}
+
+static AlarmEvent hotEvent(RuleDecision d, float v, MonoMs t) {
+  AlarmEvent e;
+  e.ruleId = 0;
+  e.decision = d;
+  e.sample = airTemp(v, t);
+  return e;
+}
+
+static void test_safety_latched_interlock_beats_lamp_until_reset(void) {
+  SafetyCore c;
+  Snapshot s;
+  lampOnAt31s(&c, &s, &kHotRule, 1);
+  const AlarmEvent trip = hotEvent(RULE_DECISION_TRIP, 41.0f, 31200);
+  SafetyOutputs o = step(&c, &s, 31200, &trip, 1);
+  TEST_ASSERT_FALSE(o.relayOn);
+  TEST_ASSERT_TRUE(o.interlock);
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_INTERLOCK, o.lampReason);
+  TEST_ASSERT_EQUAL_HEX16(0x0001, o.latchedMask);
+
+  TEST_ASSERT_FALSE(safetyCoreResetLatch(&c, 0));  // still active: refused
+  const AlarmEvent clear = hotEvent(RULE_DECISION_CLEAR, 36.0f, 40000);
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 40000);
+  o = step(&c, &s, 40000, &clear, 1);
+  TEST_ASSERT_FALSE(o.relayOn);  // cleared but latched
+  TEST_ASSERT_EQUAL_HEX16(0x0001, o.latchedMask);
+  TEST_ASSERT_EQUAL_HEX16(0x0000, o.activeMask);
+
+  TEST_ASSERT_TRUE(safetyCoreResetLatch(&c, 0));
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 41000);
+  TEST_ASSERT_FALSE(step(&c, &s, 41000, NULL, 0).relayOn);  // OFF dwell from the interlock
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 61300);
+  TEST_ASSERT_TRUE(step(&c, &s, 61300, NULL, 0).relayOn);
+}
+
+static void test_safety_trip_and_clear_in_one_batch_still_deenergises(void) {
+  AlarmRule rule = kHotRule;
+  rule.latching = false;
+  SafetyCore c;
+  Snapshot s;
+  lampOnAt31s(&c, &s, &rule, 1);
+  const AlarmEvent batch[2] = {hotEvent(RULE_DECISION_TRIP, 50.0f, 31100),
+                               hotEvent(RULE_DECISION_CLEAR, 30.0f, 31150)};
+  SafetyOutputs o = step(&c, &s, 31200, batch, 2);
+  TEST_ASSERT_FALSE(o.relayOn);  // the unhandled TRIP is not erased by the CLEAR
+  TEST_ASSERT_TRUE(o.interlock);
+  TEST_ASSERT_EQUAL_HEX16(0x0000, o.activeMask);
+  TEST_ASSERT_EQUAL_UINT32(1, c.rule[0].trips);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 50.0f, c.rule[0].worst);
+}
+
+static void test_safety_disabled_rule_and_auto_switch(void) {
+  AlarmRule rule = kHotRule;
+  rule.enabled = false;
+  SafetyCore c;
+  Snapshot s;
+  lampOnAt31s(&c, &s, &rule, 1);
+  const AlarmEvent trip = hotEvent(RULE_DECISION_TRIP, 41.0f, 31200);
+  TEST_ASSERT_TRUE(step(&c, &s, 31200, &trip, 1).relayOn);  // disabled: no interlock
+
+  SafetyConfig off = kSafetyTest;
+  off.lampAutoEnabled = false;
+  safetyCoreInit(&c, &off, NULL, 0, 0);
+  snapshotReset(&s);
+  SafetyOutputs o = {0};
+  for (MonoMs t = 1000; t <= 31000; t += 1000) {
+    setLight(&s, 10.0f, HEALTH_UNCALIBRATED, t);
+    o = step(&c, &s, t, NULL, 0);
+  }
+  TEST_ASSERT_TRUE(o.lampWantsOn);
+  TEST_ASSERT_FALSE(o.relayOn);
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_DISABLED, o.lampReason);
+}
+
+static void test_safety_reports_stale_rule_inputs(void) {
+  SafetyCore c;
+  Snapshot s;
+  safetyCoreInit(&c, &kSafetyTest, &kHotRule, 1, 0);
+  snapshotReset(&s);
+  TEST_ASSERT_EQUAL_HEX16(0x0001, step(&c, &s, 100, NULL, 0).staleMask);  // never measured
+  s.readings[METRIC_AIR_TEMPERATURE] = airTemp(25.0f, 1000);
+  TEST_ASSERT_EQUAL_HEX16(0x0000, step(&c, &s, 1500, NULL, 0).staleMask);
+  TEST_ASSERT_EQUAL_HEX16(0x0001, step(&c, &s, 2100, NULL, 0).staleMask);  // > 1 s
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -291,6 +614,8 @@ int main(int argc, char** argv) {
   RUN_TEST(test_trimmed_mean_rejects_spikes);
   RUN_TEST(test_snapshot_reset_indexes_by_metric);
   RUN_TEST(test_production_ready_requires_power_sense);
+  RUN_TEST(test_snapshot_reset_sets_identity);
+  RUN_TEST(test_alarm_rule_ignores_stale_sample);
   RUN_TEST(test_sgp30_crc_matches_datasheet_vector);
   RUN_TEST(test_sgp30_words_round_trip_and_reject_bad_crc);
   RUN_TEST(test_sgp30_humidity_fixed_point);
@@ -305,5 +630,21 @@ int main(int argc, char** argv) {
   RUN_TEST(test_lamp_dwell_holds_changes);
   RUN_TEST(test_lamp_faults_hold_then_force_off);
   RUN_TEST(test_lamp_saturated_counts_as_bright);
+  RUN_TEST(test_alarm_trips_on_one_sample_and_clears_with_hysteresis);
+  RUN_TEST(test_alarm_persistence_needs_sustained_valid_samples);
+  RUN_TEST(test_alarm_below_rule_mirrors_above);
+  RUN_TEST(test_alarm_stale_limits_per_metric);
+  RUN_TEST(test_schedule_bme280_runs_four_times_per_frame);
+  RUN_TEST(test_schedule_skips_missed_slots_without_burst);
+  RUN_TEST(test_schedule_jitter_within_tolerance_is_not_late);
+  RUN_TEST(test_schedule_defers_step_crossing_bme280_slot);
+  RUN_TEST(test_safety_boot_off_until_data_and_dwell);
+  RUN_TEST(test_safety_dark_turns_lamp_on_after_dwell);
+  RUN_TEST(test_safety_stale_light_forces_off_without_new_sample);
+  RUN_TEST(test_safety_faults_count_per_result_not_per_wake);
+  RUN_TEST(test_safety_latched_interlock_beats_lamp_until_reset);
+  RUN_TEST(test_safety_trip_and_clear_in_one_batch_still_deenergises);
+  RUN_TEST(test_safety_disabled_rule_and_auto_switch);
+  RUN_TEST(test_safety_reports_stale_rule_inputs);
   return UNITY_END();
 }

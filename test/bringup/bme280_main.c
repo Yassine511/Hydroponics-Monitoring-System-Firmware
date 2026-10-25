@@ -13,7 +13,7 @@
 static I2cBus s_i2c = I2C_BUS_INIT;
 static Bme280Config s_config;  // address chosen at runtime in setup()
 static Bme280Driver s_driver;
-static BringupContext s_ctx = {&s_driver.base, CFG_BME280_PERIOD_MS};
+static BringupContext s_ctx = {&s_driver.base, CFG_BME280_PERIOD_MS, NULL};
 
 static const char* chipName(uint8_t id) {
   if (id == 0x60) return "BME280";

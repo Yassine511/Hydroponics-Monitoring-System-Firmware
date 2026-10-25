@@ -16,6 +16,8 @@ void lampControlInit(LampControl* self, const LampControlConfig* config, MonoMs 
   self->faults = 0;
 }
 
+void lampControlForceOff(LampControl* self, MonoMs nowMs) { setState(self, false, nowMs); }
+
 bool lampControlUpdate(LampControl* self, const Reading* light, MonoMs nowMs) {
   const bool usable = light->health == HEALTH_OK || light->health == HEALTH_UNCALIBRATED;
   if (!usable) {

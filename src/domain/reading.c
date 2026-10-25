@@ -80,10 +80,45 @@ const char* unitName(Unit u) {
   return "?";
 }
 
+static SensorId metricSensor(MetricId m) {
+  switch (m) {
+    case METRIC_AIR_TEMPERATURE:
+    case METRIC_AIR_HUMIDITY:
+    case METRIC_AIR_PRESSURE: return SENSOR_BME280;
+    case METRIC_WATER_TEMPERATURE: return SENSOR_DS18B20;
+    case METRIC_LIGHT_LEVEL: return SENSOR_LIGHT;
+    case METRIC_WATER_DISTANCE: return SENSOR_HCSR04;
+    case METRIC_PH: return SENSOR_PH;
+    case METRIC_TDS: return SENSOR_TDS;
+    case METRIC_TVOC:
+    case METRIC_CO2EQ: return SENSOR_SGP30;
+    case METRIC_COUNT: break;
+  }
+  return SENSOR_COUNT;
+}
+
+// The unit each driver publishes when calibrated. pH and light may publish
+// mV while uncalibrated; the Reading's own unit field says which.
+static Unit metricUnit(MetricId m) {
+  switch (m) {
+    case METRIC_AIR_TEMPERATURE: return UNIT_DEG_C;
+    case METRIC_AIR_HUMIDITY: return UNIT_PERCENT_RH;
+    case METRIC_AIR_PRESSURE: return UNIT_PASCAL;
+    case METRIC_WATER_TEMPERATURE: return UNIT_DEG_C;
+    case METRIC_LIGHT_LEVEL: return UNIT_MILLIVOLT;
+    case METRIC_WATER_DISTANCE: return UNIT_MILLIMETRE;
+    case METRIC_PH: return UNIT_PH;
+    case METRIC_TDS: return UNIT_PPM;
+    case METRIC_TVOC: return UNIT_PPB;
+    case METRIC_CO2EQ: return UNIT_PPM;
+    case METRIC_COUNT: break;
+  }
+  return UNIT_NONE;
+}
+
 void snapshotReset(Snapshot* s) {
   memset(s, 0, sizeof(*s));
   for (uint8_t i = 0; i < METRIC_COUNT; ++i) {
-    s->readings[i].metric = (MetricId)i;
-    s->readings[i].health = HEALTH_STARTING;
+    readingReset(&s->readings[i], metricSensor((MetricId)i), (MetricId)i, metricUnit((MetricId)i));
   }
 }

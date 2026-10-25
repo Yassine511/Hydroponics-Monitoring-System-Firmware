@@ -12,10 +12,10 @@
 // and faultsToOff such readings in a row force OFF at once (safe state: relay
 // de-energised, lamp on NO contact).
 //
-// Bring-up deviation from §10 (reading.h): this acts on UNCALIBRATED mV and
-// does not check reading age. A stalled sensor (no READY result reaches the
-// caller) freezes the last state, possibly ON. WP7 must either calibrate
-// light or accept relative mV explicitly, and add a staleness -> OFF rule.
+// Acts on UNCALIBRATED mV by explicit decision (relative light level; no lux
+// calibration, D13). It does not check reading age itself: in production
+// domain/safety_core feeds it each new light result and calls
+// lampControlForceOff() when the light data is stale (audit B1).
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -44,6 +44,10 @@ void lampControlInit(LampControl* self, const LampControlConfig* config, MonoMs 
 
 // Feed one light reading; returns the lamp state to drive.
 bool lampControlUpdate(LampControl* self, const Reading* light, MonoMs nowMs);
+
+// Switch OFF now, ignoring the dwell (stale light data, interlock: §12). The
+// OFF dwell starts here, so the lamp cannot come straight back on.
+void lampControlForceOff(LampControl* self, MonoMs nowMs);
 
 // Time in the current state.
 static inline uint32_t lampControlHeldMs(const LampControl* self, MonoMs nowMs) {

@@ -35,6 +35,10 @@ editable source is [`docs/architecture/`](docs/architecture/); rebuild with
 `python docs/architecture/build.py` (needs ReportLab). Section numbers (§) below
 refer to Rev 3. The old team code is kept unchanged and is used only as reference.
 
+The Stage 4 FreeRTOS design (tasks, scheduling, channels, Safety, supervision) is in
+[`RTOS Architecture.pdf`](RTOS%20Architecture.pdf); its source is [`docs/rtos/`](docs/rtos/)
+(`python docs/rtos/build.py`, reuses the kit in `docs/architecture/`).
+
 **Status: Stage 1 skeleton plus first drivers.** The shared contracts are in
 place and every module exists and compiles. The BME280 (WP1), DS18B20 (WP2), light (WP3), HC-SR04 (WP4),
 pH and TDS (WP5) and SGP30 (WP6) drivers are written; the others are still stubs (see "Work packages").
@@ -122,6 +126,11 @@ fields and field order did not. The team lead should review that once.
 
 To change one, open a short review with the team lead. Do not edit them inside a feature branch. Each change needs a hardware or measurement reason.
 
+**Contract note (25 Oct 2026, audit D6):** every driver sets
+`Reading.lastGoodMs` for each *usable* result, `HEALTH_OK` or
+`HEALTH_UNCALIBRATED`; the `reading.h` comment says so. Comment-only change:
+no field, order or size change.
+
 ## Work packages
 
 | WP | Scope | Files | Stage | Blocked by |
@@ -132,10 +141,10 @@ To change one, open a short review with the team lead. Do not edit them inside a
 | WP4 | HC-SR04 + pulse capture (GPIO edge ISR + `esp_timer`) | `drivers/hcsr04.*`, `hal/pulse_capture.*`, `domain/ultrasonic.*` | 3 | ECHO divider verified (**driver written 24 Oct 2026, nominal 343 m/s, no temperature compensation; not yet run on hardware** — see "HC-SR04 bring-up") |
 | WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*`, `domain/tds_codec.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration". **TDS driver written 24 Oct 2026, nominal datasheet curve (uncalibrated); running on S3 hardware 24 Oct 2026: air 0 mV, tap ~1245 mV, hot ~1922 mV, salted water over range (FAULT); compensation checked with the DS18B20 in `test_water` (switched to ppm/EC compensation, ~5 % across 11-34 degC); reference solution not yet tested** — see "SEN0244 TDS bring-up") |
 | WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `domain/sgp30_codec.*`, `hal/i2c_bus.*` (raw write/read), `test/bringup/sgp30_main.c`, `test/bringup/climate_main.c` | 2 | — (**running on S3 hardware 22 Oct 2026: feature set 0x0020 @0x58, 1 s cadence, 13 ms per measurement, no CRC faults; breath and hand-sanitiser spikes seen. Runs with the BME280 on the shared bus in `test_climate`, with humidity compensation. Baseline save/restore, 12 h learning and fault recovery not yet tested**; baseline is RAM-only until WP8 stores it in NVS) |
-| WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*` | 4 | ≥1 working driver; thresholds |
+| WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*`, `domain/schedule.*`, `domain/safety_core.*`, `include/policy_config.h` | 4 | — (**domain logic done 25 Oct 2026**: rule evaluation with hysteresis/persistence/staleness, absolute-deadline job table with skip-not-catch-up, pure Safety state machine with lamp policy, stale → OFF and DEENERGIZE interlock; 41 host tests. **Services written 25 Oct 2026, builds, not yet run on hardware:** AcqNormal runs all 7 drivers as the single worker (D15); Safety task owns the relay (`hal/relay.c`); `main.c` boots safe outputs → logger → Safety → acquisition → Supervisor. Readings are stamped with the rail epoch but **not gated on 5 V validity until WP9**. Thresholds still placeholders: rules ship **disabled** in `policy_config.h`; lamp auto-control **enabled**) |
 | WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*` | 5 | WP7 snapshot |
 | WP9 | Power ISR, rail epoch, lease handover | `services/power_coordinator.*`, `services/rail_state.*` | 6 | — (power sense on GPIO8 measured 25 Oct 2026; ISR must self-disable + 20 ms qualification) |
-| WP10 | Logger queue, supervisor, watchdogs | `diagnostics/*`, `services/supervisor.*` | 4 | — |
+| WP10 | Logger queue, supervisor, watchdogs | `diagnostics/*`, `services/supervisor.*` | 4 | — (**written and run on S3 hardware 25 Oct 2026; stall tests PASS** (see "Production run"): logger queue + SerialLogger task (drop and count); cross-core progress stamps; Supervisor checks progress deadlines (Safety 1 s, AcqNormal 2 s, logger 2 s when busy), loss/lateness counters, stack high-water marks and internal heap; AcqNormal and Safety subscribed to the 5 s task watchdog, each resetting it only for itself; `stall_acq` / `stall_safety` envs for the §19 stall test) |
 
 WP2, WP3, WP6 and WP10 can start in parallel. A driver counts as done when it meets the "Completion evidence" column of the §16 table. Compiling is not enough.
 
@@ -179,6 +188,80 @@ If the first build fails:
 
 - **`build_src_filter` rejects `../test/bringup/...`:** move the bring-up mains to `src/bringup/`, point the filters there, and add `-<bringup/>` to the `esp32dev` and `native` filters.
 - **Toolchain or path errors:** the project path contains spaces. Try setting `PLATFORMIO_CORE_DIR` to a path without spaces. This is something to check, not a confirmed problem.
+
+## Production run (Stage 4, `esp32dev`)
+
+```bash
+pio run -e esp32dev -t upload -t monitor
+```
+
+> **This image switches the relay by itself.** About 30 s after boot in a dark
+> room, Safety energises GPIO15 (lamp ON). Test with a low-voltage load on
+> COM/NO first. The 230 V hookup follows "Lamp relay bring-up": supply
+> unplugged while wiring, module enclosed, supervisor check before power-on.
+> Lamp auto-control can be switched off with `POLICY_LAMP_AUTO_ENABLED 0` in
+> `include/policy_config.h` (Safety then reports the decision but keeps the
+> relay off).
+
+Boot prints the board gate, `safety: started`, `acq: started` and one
+`acq: <sensor> init OK` per driver, then the reset reason. Every 5 s Supervisor
+prints two lines: the readings (`~` = UNCALIBRATED, a health name = no value)
+and `lamp ON/OFF (reason) | latched | frames / late / skip / jitter | guard / fail |
+health OK` (or `DEGRADED <first cause>` if anything went wrong in those 5 s).
+A failed reading with a raw value shows it, e.g. `dist TIMEOUT(raw 30012)` =
+ECHO rose but no echo came back; plain `dist TIMEOUT` = ECHO never rose.
+Relay changes and lamp faults are logged as they happen. Supervisor also logs
+`sup: <task> no progress for N ms` (once per stall), `sup: counters up: ...`
+when a late/skip/guard/overflow/drop counter rises, and every 60 s the stack
+free bytes per task and the internal heap (`sup: stack free B ...`).
+
+Bench checks (not done yet):
+
+| Check | Expected |
+|-------|----------|
+| Status line | every metric shows a value or an explained health |
+| Cover the light sensor | `relay ON (level)` after the 30 s dwell |
+| Torch on the sensor | `relay OFF (level)` after the 30 s dwell |
+| Hold inside the 40-120 mV band | no relay change |
+| Reset / power-cycle | relay OFF through boot |
+| Steady state, 30 min | `guard 0 fail 0`, `late 0`, jitter <= 5 ms |
+
+Stall test (§19): `pio run -e stall_acq -t upload -t monitor` (or `stall_safety`).
+After 60 s the task blocks forever. Expected for `stall_acq`: `acq: INJECTED
+STALL`, lamp `stale` -> OFF within ~3 s, `sup: acq no progress for 2xxx ms`,
+task-watchdog panic at ~5 s, then `reset reason: TASK_WDT` after the reboot.
+For `stall_safety`: `sup: safety no progress for 1xxx ms`, the relay keeps its
+last level until the reset at ~5 s, then OFF through boot. Reflash `esp32dev`
+afterwards.
+
+Alarm latency test (§19 "Temperature alarm"): `pio run -e alarm_latency -t upload
+-t monitor`. A test rule trips on every valid BME280 sample (4 per second, so
+every frame phase) and de-energises the relay. Every 20 TRIPs Safety logs
+`latency #N (20 TRIPs): submit->action us min/avg/max | sample->action ms
+min/avg/max`. Target: sample -> Safety action <= 10 ms. Reflash `esp32dev`
+afterwards (the test rule keeps the relay off).
+
+Hardware results, 25 Oct 2026 (breadboard, sensors in air):
+
+| Check | Measured |
+|-------|----------|
+| Boot | all 7 drivers `init OK`, `health OK`; 276 frames with `late 0 skip 0 jitter 0 ms guard 0 fail 0` |
+| Lamp | dark -> ON; torch -> OFF at once (ON dwell over); dark again -> ON **30.0 s** after the OFF (OFF dwell); 2 relay changes in 3 min, no chatter |
+| `stall_acq` | stall 60.34 s; `sup: acq no progress for 2227 ms` 62.51 s; `safety: lamp stale` 62.51 s; TWDT names `AcqNormal (CPU 1)` at 65.44 s; reboot `reset reason: TASK_WDT` |
+| `stall_safety` | stall 60.35 s; `sup: safety no progress for 1202 ms` 61.33 s; TWDT names `Safety (CPU 0)` at 65.53 s; reboot `reset reason: TASK_WDT` |
+| Stack free (min, B) | Safety 1348 / 3072 (after its first log call), AcqNormal 2304 / 4096, SerialLogger 896 / 2048, Supervisor 1016 / 3072 (600 before its line buffers were made static) |
+| Heap (internal) | free 342 KB, minimum 337 KB, largest block 303 KB |
+
+Not yet run: alarm latency (`alarm_latency` env built, board run pending);
+hold inside the 40-120 mV band and reset with the lamp ON (need the MOSFET
+stage: the relay module does not release from a 3.3 V GPIO); 24 h endurance
+(not planned for now). Safety's float log path (rule
+TRIP/CLEAR lines) has not executed yet, so its stack figure excludes it.
+
+Known limits: if the light S wire is pulled, the 1 uF capacitor decays to ~0 mV,
+which reads as darkness and switches the lamp ON; firmware cannot detect it.
+Alarm rules are all disabled (no commissioned thresholds). Readings are not
+gated on the 5 V rail until WP9.
 
 ## pH-4502C calibration (WP5)
 
@@ -244,7 +327,7 @@ once (~12 ms).
 | Scratchpad CRC wrong, or config fixed bits wrong (all-zero read) | `HEALTH_FAULT`, no raw |
 | Register = 0550h (+85 degC power-on value) | `HEALTH_FAULT`; the next frame re-inits |
 | Outside -55..+125 degC | `HEALTH_FAULT` |
-| No presence pulse | `init -> NOT_PRESENT` or `poll -> NOT_PRESENT`, re-init next frame |
+| No presence pulse | `start`/`poll -> NOT_PRESENT`, result becomes `HEALTH_FAULT` (lastGoodMs kept), re-init next frame. `init -> NOT_PRESENT` leaves the result unchanged |
 | `init -> FAULT` repeatedly on a sensor that answers | the scratchpad config byte fails the fixed-bit check; suspect a clone part |
 
 The TDS driver takes this reading through `tdsDriverSetWaterTemperature()`.
@@ -274,8 +357,9 @@ with a 1 s frame, like `test_climate` does for the I2C pair. Each frame:
 
 1. It passes the latest DS18B20 reading, from the previous frame, to the TDS
    driver with `tdsDriverSetWaterTemperature()`. A faulty reading is passed
-   as is, so the TDS driver reports `NO TEMP` instead of using it. After a
-   `NOPRES` frame the last good reading is still used until it is 3 s old.
+   as is, so the TDS driver reports `NO TEMP` instead of using it. Since 25 Oct
+   2026 (audit L2) a `NOPRES` frame also writes a FAULT result, so TDS shows
+   `NO TEMP` from the next frame on instead of using the old value for 3 s.
 2. It starts both drivers and polls them in turn. The 750 ms DS18B20
    conversion and the ~560 ms TDS window overlap, so both fit in one frame. Run
    one after the other, they would take ~1.3 s.

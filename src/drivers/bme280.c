@@ -154,7 +154,7 @@ static PollResult bme280Poll(SensorDriver* d, MonoMs now) {
   }
 
   // ctrl_hum + status in one burst. ctrl_hum back at its reset value means the
-  // module was power-cycled and lost its settings: re-init.
+  // module was power-cycled and lost its settings: fail, so the caller re-inits.
   uint8_t cs[2] = {0, 0};
   if (!i2cBusReadRegs(bus, address, kRegCtrlHum, cs, sizeof(cs))) {
     i2cBusRecover(bus);

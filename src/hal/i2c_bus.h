@@ -31,5 +31,7 @@ bool i2cBusReadRegs(I2cBus* bus, uint8_t address, uint8_t reg, uint8_t* buf, siz
 // repeated start. A read returns true only if all `len` bytes arrived.
 bool i2cBusWrite(I2cBus* bus, uint8_t address, const uint8_t* tx, size_t len);
 bool i2cBusRead(I2cBus* bus, uint8_t address, uint8_t* buf, size_t len);
+// Call after a failed transaction. Does nothing (returns true) when SDA is
+// high, i.e. the failure was only a NACK; recovers only a bus held low.
 bool i2cBusRecover(I2cBus* bus);
 void i2cBusEnd(I2cBus* bus);

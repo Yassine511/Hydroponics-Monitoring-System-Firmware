@@ -107,6 +107,7 @@ static PollResult finish(PhDriver* self, MonoMs now) {
     r->unit = UNIT_MILLIVOLT;
     r->value = moduleMv;
     r->health = HEALTH_UNCALIBRATED;
+    r->lastGoodMs = now;  // last usable result (OK or UNCALIBRATED), as the SGP30
     ++r->sequence;  // a fresh sample, in raw units
     return pr;
   }
@@ -118,12 +119,12 @@ static PollResult finish(PhDriver* self, MonoMs now) {
   }
   r->value = ph;
   ++r->sequence;
+  r->lastGoodMs = now;
   if (cfg->calibrationProvisional) {  // pH units, but not buffer-verified (D13)
     r->health = HEALTH_UNCALIBRATED;
     return pr;
   }
   r->health = HEALTH_OK;
-  r->lastGoodMs = now;
   return pr;
 }
 
