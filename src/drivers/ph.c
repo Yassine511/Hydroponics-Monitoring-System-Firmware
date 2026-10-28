@@ -113,10 +113,13 @@ static PollResult finish(PhDriver* self, MonoMs now) {
   }
   const float ph = linearApply(&cfg->calibration, moduleMv);
   r->unit = UNIT_PH;
-  if (ph < kPhMin || ph > kPhMax) {
+  if ((ph < kPhMin || ph > kPhMax) && !cfg->calibrationProvisional) {
     r->health = HEALTH_FAULT;
     return pr;
   }
+  // Out of range on the provisional (nominal) fit: the fit may simply not
+  // match this probe yet. Published UNCALIBRATED (never actionable), so the
+  // Calibration page can still capture it and fix the fit.
   r->value = ph;
   ++r->sequence;
   r->lastGoodMs = now;
@@ -167,4 +170,9 @@ void phDriverConstruct(PhDriver* self, const PhConfig* config) {
   self->lastSampleMs_ = 0;
   readingReset(&self->result_, SENSOR_PH, METRIC_PH, UNIT_PH);
   self->result_.calibrationRevision = config->calibration.revision;
+}
+
+void phDriverSetCalibration(PhDriver* self, const LinearCalibration* calibration, bool provisional) {
+  self->config_.calibration = *calibration;
+  self->config_.calibrationProvisional = provisional;
 }

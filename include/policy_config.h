@@ -30,6 +30,24 @@
 #define POLICY_PH_NOMINAL_MV_AT_PH7 2758.0f    // BNC shorted, 17 Oct 2026
 #define POLICY_PH_NOMINAL_PH_PER_MV (-0.0057f)  // tutorial sketch slope
 
+// On-device calibration (Calibration page) plausibility limits. A fit outside
+// them is refused ("bad_fit"), never stored.
+#define POLICY_PH_SLOPE_MIN_ABS 0.002f   // pH per module mV (nominal 0.0057)
+#define POLICY_PH_SLOPE_MAX_ABS 0.02f
+#define POLICY_TDS_K_MIN 0.5f            // K = reference ppm / nominal ppm
+#define POLICY_TDS_K_MAX 2.0f
+#define POLICY_LIGHT_LUX_PER_MV_MIN 0.01f
+#define POLICY_LIGHT_LUX_PER_MV_MAX 100.0f
+// cal_capture uses a reading at most this old (2 frames + slack).
+#define POLICY_CAL_CAPTURE_MAX_AGE_MS ((uint32_t)5000)
+
+// WP9 low-power mode (services/power_coordinator.h). 1 = losing the external
+// 5 V moves sensing to the low-power worker (3.3 V sensors only) and switches
+// Wi-Fi off. 0 = kill switch: report the sense level only, change nothing.
+// Not hardware-tested yet (written before the circuit existed): if a power
+// transition misbehaves on the bench, set 0 and report it.
+#define POLICY_POWER_TRANSITIONS_ENABLED 1
+
 // Retry interval for a driver whose init() failed (§18: bounded, no loop).
 #define POLICY_INIT_RETRY_MS ((uint32_t)5000)
 

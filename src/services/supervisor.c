@@ -13,8 +13,12 @@
 #include "domain/reading.h"
 #include "hal/clock.h"
 #include "services/acquisition.h"
+#include "services/configuration.h"
+#include "services/power_coordinator.h"
 #include "services/safety.h"
 #include "services/snapshot_store.h"
+#include "transports/ble_transport.h"
+#include "transports/wifi_mqtt.h"
 
 static StaticTask_t s_tcb;
 static StackType_t s_stack[3 * 1024];  // cfgTaskSpec(TASK_ID_SUPERVISOR)->stackBytes
@@ -34,6 +38,10 @@ static Watched s_watched[] = {
     {TASK_ID_SAFETY, "safety", SUPERVISOR_SAFETY_DEADLINE_MS, false, false},
     {TASK_ID_ACQUISITION_NORMAL, "acq", SUPERVISOR_ACQ_DEADLINE_MS, false, false},
     {TASK_ID_SERIAL_LOGGER, "logger", SUPERVISOR_LOGGER_DEADLINE_MS, true, false},
+    {TASK_ID_CONFIGURATION, "cfg", SUPERVISOR_CONFIG_DEADLINE_MS, false, false},
+    {TASK_ID_BLE_TRANSPORT, "ble", SUPERVISOR_BLE_DEADLINE_MS, false, false},
+    {TASK_ID_WIFI_MQTT, "wifi", SUPERVISOR_WIFI_DEADLINE_MS, false, false},
+    {TASK_ID_POWER_COORDINATOR, "power", SUPERVISOR_POWER_DEADLINE_MS, false, false},
 };
 #define WATCHED_COUNT (sizeof(s_watched) / sizeof(s_watched[0]))
 
@@ -48,7 +56,14 @@ static void markDegraded(const char* what) {
 static void checkProgress(MonoMs now) {
   for (size_t i = 0; i < WATCHED_COUNT; ++i) {
     Watched* w = &s_watched[i];
-    const MonoMs last = progressLastMs(w->id);  // 0 = never stamped: age from boot
+    TaskId id = w->id;
+    if (id == TASK_ID_ACQUISITION_NORMAL) {
+      // WP9: whichever worker holds the lease owes progress; nobody during
+      // the hand-over (PowerCoordinator reports a stuck one as DEGRADED).
+      id = acquisitionActiveTaskId();
+      if (id == TASK_ID_COUNT) continue;
+    }
+    const MonoMs last = progressLastMs(id);  // 0 = never stamped: age from boot
     const MonoMs age = now > last ? now - last : 0;
     const bool idleLogger = w->onlyWhenBusy && logQueueDepth() == 0;
     const bool late = !idleLogger && now > SUPERVISOR_BOOT_GRACE_MS && age > w->deadlineMs;
@@ -125,13 +140,18 @@ static uint32_t stackFree(TaskHandle_t t) {
 static void checkMemory(bool report) {
   const struct { const char* name; TaskHandle_t handle; } tasks[] = {
       {"safety", safetyTaskHandle()},
-      {"acq", acquisitionTaskHandle()},
+      {"acq", acquisitionNormalTaskHandle()},
       {"log", (TaskHandle_t)logTaskHandle()},
       {"sup", s_task},
+      {"cfg", (TaskHandle_t)configurationTaskHandle()},
+      {"ble", (TaskHandle_t)bleTransportTaskHandle()},
+      {"wifi", (TaskHandle_t)wifiMqttTaskHandle()},
+      {"acqlp", acquisitionLowPowerTaskHandle()},
+      {"pwr", (TaskHandle_t)powerCoordinatorTaskHandle()},
   };
-  uint32_t freeB[4];
+  uint32_t freeB[9];
   bool low = false;
-  for (size_t i = 0; i < 4; ++i) {
+  for (size_t i = 0; i < 9; ++i) {
     freeB[i] = stackFree(tasks[i].handle);
     if (tasks[i].handle != NULL && freeB[i] < SUPERVISOR_STACK_WARN_BYTES) {
       low = true;
@@ -145,11 +165,13 @@ static void checkMemory(bool report) {
   if (heapLow) markDegraded("heap");
   if (report || low || heapLow) {
     logPrintf(low || heapLow ? LOG_LEVEL_WARN : LOG_LEVEL_INFO,
-              "sup: stack free B safety %lu acq %lu log %lu sup %lu | heap int free %lu min %lu"
-              " largest %lu",
+              // Fits LOG_TEXT_LEN (128) with every value at 6 digits.
+              "sup: stack B saf %lu acq %lu log %lu sup %lu cfg %lu ble %lu wifi %lu | heap %lu min %lu big %lu",
               (unsigned long)freeB[0], (unsigned long)freeB[1], (unsigned long)freeB[2],
-              (unsigned long)freeB[3], (unsigned long)heapFree, (unsigned long)heapMin,
+              (unsigned long)freeB[3], (unsigned long)freeB[4], (unsigned long)freeB[5], (unsigned long)freeB[6], (unsigned long)heapFree, (unsigned long)heapMin,
               (unsigned long)largest);
+    logPrintf(low ? LOG_LEVEL_WARN : LOG_LEVEL_INFO, "sup: stack B acqlp %lu pwr %lu", (unsigned long)freeB[7],
+              (unsigned long)freeB[8]);
   }
 }
 

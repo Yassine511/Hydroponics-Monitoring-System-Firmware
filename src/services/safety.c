@@ -13,7 +13,11 @@
 #include "hal/clock.h"
 #include "hal/relay.h"
 #include "policy_config.h"
+#include "services/configuration.h"
+#include "services/rail_state.h"
 #include "services/snapshot_store.h"
+
+_Static_assert(EVENT_JOURNAL_LEN == CFG_ALARM_JOURNAL_LEN, "journal length must match app_config.h");
 
 // ---- Sticky per-rule store (§11): survives a full detail queue -------------
 typedef struct StickySlot {
@@ -41,7 +45,24 @@ static StaticTask_t s_tcb;
 static StackType_t s_stack[3 * 1024];  // cfgTaskSpec(TASK_ID_SAFETY)->stackBytes
 static TaskHandle_t s_task = NULL;
 
+// ---- WP8: command queue and event journal -----------------------------------
+typedef struct SafetyRequest {
+  SafetyCommand command;
+  SafetyReplyFn reply;
+  void* ctx;
+} SafetyRequest;
+
+static StaticQueue_t s_commandControl;
+static uint8_t s_commandStorage[SAFETY_MAX_COMMANDS * sizeof(SafetyRequest)];
+static QueueHandle_t s_commands = NULL;
+
+static portMUX_TYPE s_journalMux = portMUX_INITIALIZER_UNLOCKED;
+static EventJournal s_journal;
+
 // Task-private state: static, never on the 3 KiB stack.
+static SafetyRequest s_requests[SAFETY_MAX_COMMANDS];
+static SafetyCommand s_cmds[SAFETY_MAX_COMMANDS];
+static ConfigBlob s_cfg;
 static SafetyCore s_core;
 static Snapshot s_snap;
 static AlarmEvent s_events[CFG_ALARM_DETAIL_QUEUE_LEN + 2 * POLICY_RULE_COUNT];
@@ -84,6 +105,10 @@ static void latencyRecord(const AlarmEvent* events, uint8_t n) {
   const int64_t us = esp_timer_get_time() - submitted;
   const MonoMs now = monoNowMs();
   const uint32_t ms = now > trip->sample.intervalEndMs ? (uint32_t)(now - trip->sample.intervalEndMs) : 0;
+  if (ms > 5 || us > 5000) {  // one slow trip: when exactly (the 20-trip summary hides it)
+    logPrintf(LOG_LEVEL_WARN, "latency SPIKE at t=%lu ms: submit->action %lld us, sample->action %lu ms",
+              (unsigned long)now, (long long)us, (unsigned long)ms);
+  }
   if (s_lat.n == 0 || us < s_lat.minUs) s_lat.minUs = us;
   if (s_lat.n == 0 || us > s_lat.maxUs) s_lat.maxUs = us;
   if (s_lat.n == 0 || ms < s_lat.minMs) s_lat.minMs = ms;
@@ -164,6 +189,49 @@ static uint8_t drainEvents(void) {
   return n;
 }
 
+bool safetySubmitCommand(const SafetyCommand* command, SafetyReplyFn reply, void* ctx) {
+  if (s_commands == NULL || command == NULL) return false;
+  const SafetyRequest request = {*command, reply, ctx};
+  if (xQueueSend(s_commands, &request, 0) != pdTRUE) return false;
+  if (s_task != NULL) xTaskNotifyGive(s_task);
+  return true;
+}
+
+void safetyJournalCursorInit(JournalCursor* cursor) {
+  portENTER_CRITICAL(&s_journalMux);
+  journalCursorInit(&s_journal, cursor);
+  portEXIT_CRITICAL(&s_journalMux);
+}
+
+bool safetyJournalNext(JournalCursor* cursor, JournalEvent* out, bool* gap) {
+  portENTER_CRITICAL(&s_journalMux);
+  const bool got = journalNext(&s_journal, cursor, out, gap);
+  portEXIT_CRITICAL(&s_journalMux);
+  return got;
+}
+
+static void journal(uint8_t ruleId, JournalKind kind, MonoMs atMs, float value) {
+  JournalEvent e;
+  memset(&e, 0, sizeof(e));
+  e.ruleId = ruleId;
+  e.severity = ruleId < POLICY_RULE_COUNT ? kPolicyRules[ruleId].severity : SEVERITY_INFO;
+  e.kind = kind;
+  e.atMs = atMs;
+  e.value = value;
+  portENTER_CRITICAL(&s_journalMux);
+  journalAppend(&s_journal, &e);
+  portEXIT_CRITICAL(&s_journalMux);
+}
+
+static uint8_t drainCommands(void) {
+  uint8_t n = 0;
+  while (n < SAFETY_MAX_COMMANDS && xQueueReceive(s_commands, &s_requests[n], 0) == pdTRUE) {
+    s_cmds[n] = s_requests[n].command;
+    ++n;
+  }
+  return n;
+}
+
 static void safetyTask(void* arg) {
   (void)arg;
   SafetyOutputs out;
@@ -186,8 +254,12 @@ static void safetyTask(void* arg) {
 #endif
     const MonoMs now = monoNowMs();
     const uint8_t n = drainEvents();
+    const uint8_t nCmd = drainCommands();
     const bool haveSnap = snapshotPeek(&s_snap);
-    const SafetyInputs in = {haveSnap ? &s_snap : NULL, s_events, n, now};
+    configurationPeekApplied(&s_cfg);  // defaults (all on) if Configuration is not running
+    const SensorMask disabled = (SensorMask)(SENSOR_MASK_ALL & (SensorMask)~s_cfg.sensorEnabled);
+    const SafetyInputs in = {haveSnap ? &s_snap : NULL, s_events, n, now, s_cmds, nCmd, disabled,
+                             !railStateRead().valid5v};
     safetyCoreStep(&s_core, &in, &out);
 
     const bool relayChanged = out.relayOn != relayOn;
@@ -207,10 +279,22 @@ static void safetyTask(void* arg) {
       logPrintf(LOG_LEVEL_WARN, "safety: lamp %s", lampReasonName(out.lampReason));
     }
     lastReason = out.lampReason;
+    for (uint8_t i = 0; i < out.resultCount && i < nCmd; ++i) {
+      if (out.results[i].outcome == SAFETY_CMD_APPLIED) {
+        journal(s_cmds[i].ruleId, JOURNAL_KIND_RESET, now, 0.0f);
+        logPrintf(LOG_LEVEL_INFO, "safety: rule %u latch reset", (unsigned)s_cmds[i].ruleId);
+      }
+      if (s_requests[i].reply != NULL) {
+        s_requests[i].reply(out.results[i].tag, out.results[i].outcome, s_requests[i].ctx);
+      }
+    }
     for (uint8_t i = 0; i < n; ++i) {
 #ifdef FW_ALARM_LATENCY_TEST
       if (s_events[i].decision == RULE_DECISION_TRIP && s_events[i].ruleId == 0) continue;  // 4 per s
 #endif
+      journal(s_events[i].ruleId,
+              s_events[i].decision == RULE_DECISION_TRIP ? JOURNAL_KIND_TRIP : JOURNAL_KIND_CLEAR,
+              s_events[i].sample.intervalEndMs, s_events[i].sample.value);
       logPrintf(LOG_LEVEL_WARN, "safety: rule %u %s (%s = %.2f)", (unsigned)s_events[i].ruleId,
                 s_events[i].decision == RULE_DECISION_TRIP ? "TRIP" : "CLEAR",
                 metricName(s_events[i].sample.metric), (double)s_events[i].sample.value);
@@ -239,14 +323,19 @@ bool safetyInit(void) {
   s_detail = xQueueCreateStatic(CFG_ALARM_DETAIL_QUEUE_LEN, sizeof(AlarmEvent), s_detailStorage,
                                 &s_detailControl);
   s_status = xQueueCreateStatic(1, sizeof(SafetyStatus), s_statusStorage, &s_statusControl);
-  if (s_detail == NULL || s_status == NULL) return false;
+  s_commands = xQueueCreateStatic(SAFETY_MAX_COMMANDS, sizeof(SafetyRequest), s_commandStorage,
+                                  &s_commandControl);
+  if (s_detail == NULL || s_status == NULL || s_commands == NULL) return false;
+  journalInit(&s_journal);
 
-  static const SafetyConfig kConfig = {
-      POLICY_LAMP_AUTO_ENABLED != 0,
-      {POLICY_LAMP_ON_BELOW_MV, POLICY_LAMP_OFF_ABOVE_MV, POLICY_LAMP_MIN_ON_MS,
-       POLICY_LAMP_MIN_OFF_MS, POLICY_LAMP_FAULTS_TO_OFF},
-      POLICY_LIGHT_STALE_MS};
-  safetyCoreInit(&s_core, &kConfig, kPolicyRules, POLICY_RULE_COUNT, monoNowMs());
+  // Lamp policy from the applied configuration (compiled defaults in 8.2).
+  configurationPeekApplied(&s_cfg);
+  SafetyConfig config;
+  memset(&config, 0, sizeof(config));
+  config.lampAutoEnabled = s_cfg.lampAutoEnabled;
+  config.lamp = s_cfg.lamp;
+  config.lightStaleMs = POLICY_LIGHT_STALE_MS;
+  safetyCoreInit(&s_core, &config, kPolicyRules, POLICY_RULE_COUNT, monoNowMs());
   relayWrite(false);
 
   const TaskSpec* spec = cfgTaskSpec(TASK_ID_SAFETY);
@@ -254,12 +343,12 @@ bool safetyInit(void) {
     logPrintf(LOG_LEVEL_WARN, "safety: stack %u B, task table says %lu B",
               (unsigned)sizeof(s_stack), (unsigned long)spec->stackBytes);
   }
+  const BaseType_t safetyCore = spec->core;
   s_task = xTaskCreateStaticPinnedToCore(safetyTask, spec->name, sizeof(s_stack), NULL,
-                                         spec->priority, s_stack, &s_tcb, spec->core);
+                                         spec->priority, s_stack, &s_tcb, safetyCore);
   if (s_task == NULL) return false;
   logPrintf(LOG_LEVEL_INFO, "safety: started (core %u, prio %u), lamp auto %s, relay OFF",
-            (unsigned)spec->core, (unsigned)spec->priority,
-            POLICY_LAMP_AUTO_ENABLED ? "ON" : "off");
+            (unsigned)safetyCore, (unsigned)spec->priority, s_cfg.lampAutoEnabled ? "ON" : "off");
   return true;
 }
 

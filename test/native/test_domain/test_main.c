@@ -272,6 +272,18 @@ static void test_lamp_hysteresis_band(void) {
   TEST_ASSERT_FALSE(lampControlUpdate(&c, &r, 201000));
 }
 
+// After an on-device lux fit the value is lux; the thresholds stay pin mV (raw).
+static void test_lamp_uses_pin_mv_after_lux_fit(void) {
+  LampControl c;
+  lampControlInit(&c, &kLampTest, 0);
+  Reading r = lampLight(10.0f, HEALTH_OK);  // 10 mV at the pin: dark
+  r.unit = UNIT_LUX;
+  r.value = 500.0f;  // would be "bright" if read as mV
+  r.hasRaw = true;
+  r.raw = 10;
+  TEST_ASSERT_TRUE(lampControlUpdate(&c, &r, 60000));
+}
+
 static void test_lamp_dwell_holds_changes(void) {
   LampControl c;
   lampControlInit(&c, &kLampTest, 0);
@@ -476,6 +488,24 @@ static void test_safety_boot_off_until_data_and_dwell(void) {
   TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_DWELL, o.lampReason);
 }
 
+// WP9: the relay coil is on the external 5 V. Rail down = relay OFF, and the
+// lamp restarts from OFF (with its dwell) once the rail is back.
+static void test_safety_rail_down_forces_relay_off(void) {
+  SafetyCore c;
+  Snapshot s;
+  lampOnAt31s(&c, &s, NULL, 0);
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 32000);
+  SafetyInputs in = {&s, NULL, 0, 32000, NULL, 0, 0, true};
+  SafetyOutputs o;
+  safetyCoreStep(&c, &in, &o);
+  TEST_ASSERT_FALSE(o.relayOn);
+  TEST_ASSERT_EQUAL(LAMP_REASON_UNPOWERED, o.lampReason);
+  TEST_ASSERT_EQUAL_STRING("no 5 V", lampReasonName(o.lampReason));
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 33000);
+  o = step(&c, &s, 33000, NULL, 0);  // rail back: still dark, but the OFF dwell holds
+  TEST_ASSERT_FALSE(o.relayOn);
+}
+
 static void test_safety_dark_turns_lamp_on_after_dwell(void) {
   SafetyCore c;
   Snapshot s;
@@ -628,6 +658,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_ds18b20_scratchpad_checks);
   RUN_TEST(test_lamp_hysteresis_band);
   RUN_TEST(test_lamp_dwell_holds_changes);
+  RUN_TEST(test_lamp_uses_pin_mv_after_lux_fit);
   RUN_TEST(test_lamp_faults_hold_then_force_off);
   RUN_TEST(test_lamp_saturated_counts_as_bright);
   RUN_TEST(test_alarm_trips_on_one_sample_and_clears_with_hysteresis);
@@ -640,6 +671,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_schedule_defers_step_crossing_bme280_slot);
   RUN_TEST(test_safety_boot_off_until_data_and_dwell);
   RUN_TEST(test_safety_dark_turns_lamp_on_after_dwell);
+  RUN_TEST(test_safety_rail_down_forces_relay_off);
   RUN_TEST(test_safety_stale_light_forces_off_without_new_sample);
   RUN_TEST(test_safety_faults_count_per_result_not_per_wake);
   RUN_TEST(test_safety_latched_interlock_beats_lamp_until_reset);

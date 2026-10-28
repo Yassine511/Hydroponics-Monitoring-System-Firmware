@@ -28,3 +28,22 @@ bool linearFromTwoPoints(float x1, float y1, float x2, float y2, uint16_t revisi
 // of the rest (spike-rejecting filter, pH-4502C tutorial: 10 samples, mean of
 // the middle 6). Returns 0 if n <= 2 * trim.
 float trimmedMeanU32(uint32_t* samples, uint8_t n, uint8_t trim);
+
+// ---- On-device calibration (WP8, Calibration page) ----------------------------
+// Which stored fits the user made on the device (ConfigBlob.calOverridden).
+// A fit without its bit is the compiled default and is refreshed at boot.
+#define CAL_BIT_PH 0x01u
+#define CAL_BIT_TDS 0x02u
+#define CAL_BIT_LIGHT 0x04u
+#define CAL_BITS_ALL 0x07u
+
+// One-point gain through the origin, y = (y1 / x1) * x (TDS K-factor, light
+// lux per mV). false if x1 or y1 is not positive or the gain is outside
+// [minGain, maxGain].
+bool linearGainFromPoint(float x1, float y1, float minGain, float maxGain, uint16_t revision,
+                         LinearCalibration* out);
+
+// Two-point pH buffer fit, rejected unless |slope| (pH per module mV) is in
+// [minAbsSlope, maxAbsSlope] and the buffers are at least 1 pH apart.
+bool phFitFromBuffers(float mv1, float ph1, float mv2, float ph2, float minAbsSlope, float maxAbsSlope,
+                      uint16_t revision, LinearCalibration* out);

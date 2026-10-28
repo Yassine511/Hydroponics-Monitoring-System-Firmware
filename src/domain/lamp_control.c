@@ -27,11 +27,14 @@ bool lampControlUpdate(LampControl* self, const Reading* light, MonoMs nowMs) {
   }
   self->faults = 0;
 
+  // Thresholds are pin mV. After an on-device lux fit the value is lux, but
+  // raw still carries the filtered pin mV: calibration never moves the lamp.
+  const float levelMv = light->unit == UNIT_MILLIVOLT || !light->hasRaw ? light->value : (float)light->raw;
   const bool bright = (light->qualityFlags & kQualitySaturated) != 0;
   bool want = self->on;
-  if (bright || light->value > self->config.offAboveMv) {
+  if (bright || levelMv > self->config.offAboveMv) {
     want = false;
-  } else if (light->value < self->config.onBelowMv) {
+  } else if (levelMv < self->config.onBelowMv) {
     want = true;
   }
   if (want == self->on) {

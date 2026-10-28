@@ -1,7 +1,505 @@
 #include "transports/ble_transport.h"
 
-// TODO(WP8): port the ESP-Demo GATT service. NimBLE-Arduino 2.5.1 (pinned in
-// platformio.ini) is a C++ wrapper; from C, use the NimBLE host C API it
-// bundles (ble_gatts_*, ble_gap_*).
+#ifndef FW_ENABLE_BLE
 
 bool bleTransportInit(void) { return false; }
+void bleTransportGetStats(BleTransportStats* out) { *out = (BleTransportStats){0}; }
+void* bleTransportTaskHandle(void) { return 0; }
+
+#else
+
+#include <Arduino.h>
+#include <ctype.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/stream_buffer.h>
+#include <freertos/task.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "app_config.h"
+#include "board_profile.h"
+#include "diagnostics/logger.h"
+#include "diagnostics/progress.h"
+#include "domain/cal_capture.h"
+#include "domain/frame_codec.h"
+#include "domain/protocol_codec.h"
+#include "domain/sensor_set.h"
+#include "hal/clock.h"
+#include "policy_config.h"
+#include "services/acquisition.h"
+#include "services/configuration.h"
+#include "services/safety.h"
+#include "services/snapshot_store.h"
+#include "transports/ble_gatt.h"
+#include "transports/frames.h"
+#include "transports/protocol.h"
+
+#define BLE_NODE_NAME TRANSPORT_NODE_NAME
+#define BLE_BOOT_PIN 0
+#define BLE_BOND_CLEAR_MS 10000u
+#define BLE_WAKE_MS 50u
+#define BLE_RX_BYTES 2048
+#define BLE_NOTIFY_RETRIES 40     // x 5 ms: NimBLE buffers free up as packets leave
+#define BLE_COMMAND_TTL_MS 5000u  // not handled within this: refused, never applied late
+#define BLE_PENDING 8             // = CFG_COMMAND_QUEUE_LEN: one slot per queued command
+#define BLE_PENDING_LIMIT_MS (BLE_COMMAND_TTL_MS + 5000u)  // a reply that never came frees its slot
+#define BLE_STATS_LOG_MS 60000u
+
+// ---- RX: filled by the NimBLE host callback, drained by this task ----------------
+static StaticStreamBuffer_t s_rxStruct;
+static uint8_t s_rxStorage[BLE_RX_BYTES + 1];
+static StreamBufferHandle_t s_rx;
+
+// ---- Task and buffers (static: never on the 6 KB stack) ---------------------------
+static StaticTask_t s_tcb;
+static StackType_t s_stack[6 * 1024];  // cfgTaskSpec(TASK_ID_BLE_TRANSPORT)->stackBytes
+static TaskHandle_t s_task = NULL;
+
+static FrameAssembler s_assembler;
+static uint8_t s_command[FRAME_MAX_PAYLOAD];
+static uint8_t s_frame[FRAME_HEADER_BYTES + FRAME_MAX_PAYLOAD];
+static char s_data[1536];
+static TransportScratch s_scratch;
+static ConfigBlob s_cfg;
+static ConfigRequest s_req;  // static: a Wi-Fi password never sits on the stack
+
+static portMUX_TYPE s_statsMux = portMUX_INITIALIZER_UNLOCKED;
+static BleTransportStats s_stats;
+#define STATS_ADD(field, n)          \
+  do {                               \
+    portENTER_CRITICAL(&s_statsMux); \
+    s_stats.field += (n);            \
+    portEXIT_CRITICAL(&s_statsMux);  \
+  } while (0)
+
+// ---- Commands in flight ----------------------------------------------------------
+// Configuration and Safety answer from their own tasks; their callbacks only
+// copy the outcome into s_results. The tag is slot | sequence << 8, so a late
+// reply can never be matched to a slot that was freed and reused.
+typedef struct Pending {
+  bool used;
+  CommandOp op;
+  uint32_t generation;
+  uint32_t seq;
+  MonoMs sinceMs;
+  char id[PROTOCOL_ID_MAX + 1];
+} Pending;
+
+typedef struct BleResult {
+  uint32_t tag;
+  ProtocolError error;
+  uint16_t cfgRev;
+} BleResult;
+
+static Pending s_pending[BLE_PENDING];
+static uint32_t s_seq;
+static StaticQueue_t s_resultControl;
+static uint8_t s_resultStorage[BLE_PENDING * sizeof(BleResult)];
+static QueueHandle_t s_results;
+static JournalCursor s_journalCursor;
+
+// NimBLE host task: copy and return (ble_gatt.h threading rule).
+static void onRx(const uint8_t* data, size_t len, uint32_t generation, void* ctx) {
+  (void)generation;
+  (void)ctx;
+  if (xStreamBufferSend(s_rx, data, len, 0) != len) STATS_ADD(rxOverflow, 1);
+  if (s_task != NULL) xTaskNotifyGive(s_task);
+}
+
+static void postResult(const BleResult* r) {
+  xQueueSend(s_results, r, 0);  // never full: one entry per pending slot
+  if (s_task != NULL) xTaskNotifyGive(s_task);
+}
+
+static void onConfigResult(const ConfigResult* r, void* ctx) {
+  (void)ctx;
+  BleResult out;
+  memset(&out, 0, sizeof(out));
+  out.tag = r->tag;
+  out.error = r->error;
+  out.cfgRev = r->cfgRev;
+  postResult(&out);
+}
+
+static void onSafetyResult(uint32_t tag, SafetyCommandOutcome outcome, void* ctx) {
+  (void)ctx;
+  BleResult out;
+  memset(&out, 0, sizeof(out));
+  out.tag = tag;
+  out.error = outcome == SAFETY_CMD_APPLIED         ? PROTOCOL_OK
+              : outcome == SAFETY_CMD_EXPIRED       ? PROTOCOL_ERR_EXPIRED
+              : outcome == SAFETY_CMD_STILL_ACTIVE  ? PROTOCOL_ERR_RULE_ACTIVE
+                                                    : PROTOCOL_ERR_BAD_FIELD;
+  postResult(&out);
+}
+
+static uint32_t sessionNow(void) { return bleGattGeneration(); }
+
+// ---- Sending ---------------------------------------------------------------------------
+// Header + payload already in s_frame. Sent in MTU-sized chunks; abandoned if
+// the session changes or NimBLE buffers stay full.
+static bool sendFrame(BleChannel channel, size_t payloadLen, uint32_t generation) {
+  if (payloadLen == 0 || !frameWriteHeader(s_frame, payloadLen)) return false;
+  const MonoMs start = monoNowMs();
+  const size_t total = FRAME_HEADER_BYTES + payloadLen;
+  for (size_t offset = 0; offset < total;) {
+    if (!bleGattSecure() || bleGattGeneration() != generation) return false;
+    size_t chunk = bleGattChunkSize();
+    if (chunk > total - offset) chunk = total - offset;
+    int tries = 0;
+    while (!bleGattNotify(channel, &s_frame[offset], chunk)) {
+      // Superseded data does not wait: the next telemetry frame replaces it.
+      if (channel == BLE_CHANNEL_TELEMETRY || ++tries >= BLE_NOTIFY_RETRIES || !bleGattSecure()) return false;
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    offset += chunk;
+  }
+  const uint32_t took = (uint32_t)(monoNowMs() - start);
+  portENTER_CRITICAL(&s_statsMux);
+  ++s_stats.framesSent;
+  if (took > s_stats.maxSendMs) s_stats.maxSendMs = took;
+  portEXIT_CRITICAL(&s_statsMux);
+  return true;
+}
+
+static char* payload(void) { return (char*)&s_frame[FRAME_HEADER_BYTES]; }
+
+static void sendResultFrame(size_t len, uint32_t generation) {
+  if (!sendFrame(BLE_CHANNEL_RESULT, len, generation)) STATS_ADD(resultsDropped, 1);
+}
+
+static void sendError(const char* id, ProtocolError error, uint32_t generation) {
+  sendResultFrame(protocolEncodeResultError(id, protocolErrorName(error), payload(), FRAME_MAX_PAYLOAD), generation);
+}
+
+static void sendBusy(const char* id, uint32_t generation) {
+  STATS_ADD(busy, 1);
+  sendResultFrame(protocolEncodeResultBusy(id, payload(), FRAME_MAX_PAYLOAD), generation);
+}
+
+// ---- State and telemetry -----------------------------------------------------------
+static void publishState(bool notify, uint32_t generation) {
+  const size_t len = transportEncodeState(&s_scratch, "ble", payload(), FRAME_MAX_PAYLOAD);
+  if (len == 0 || !frameWriteHeader(s_frame, len)) return;
+  bleGattSetStateValue(s_frame, FRAME_HEADER_BYTES + len);  // value for a plain read
+  if (notify) sendFrame(BLE_CHANNEL_STATE, len, generation);
+}
+
+static void publishTelemetry(uint32_t generation) {
+  const size_t len = transportEncodeTelemetry(&s_scratch, payload(), FRAME_MAX_PAYLOAD);
+  if (len == 0) return;
+  if (!sendFrame(BLE_CHANNEL_TELEMETRY, len, generation)) STATS_ADD(telemetryDropped, 1);
+}
+
+// ---- Commands -------------------------------------------------------------------------
+static int claimSlot(const Command* cmd, uint32_t generation) {
+  for (int i = 0; i < BLE_PENDING; ++i) {
+    if (s_pending[i].used) continue;
+    Pending* p = &s_pending[i];
+    p->used = true;
+    p->op = cmd->op;
+    p->generation = generation;
+    p->seq = ++s_seq & 0x00FFFFFFu;
+    p->sinceMs = monoNowMs();
+    memcpy(p->id, cmd->id, sizeof(p->id));
+    return i;
+  }
+  return -1;
+}
+
+static uint32_t tagOf(int slot) { return (uint32_t)slot | (s_pending[slot].seq << 8); }
+
+// Answered here, like get_sensors: a capture only peeks the snapshot (the raw
+// level every calibratable driver publishes), it never touches a driver.
+static void handleCapture(const Command* cmd, uint32_t generation) {
+  configurationPeekApplied(&s_cfg);
+  if (!sensorMaskHas(s_cfg.sensorEnabled, cmd->sensor) || !snapshotPeek(&s_scratch.snap)) {
+    sendError(cmd->id, PROTOCOL_ERR_STALE, generation);
+    return;
+  }
+  const CaptureLimits limits = {POLICY_CAL_CAPTURE_MAX_AGE_MS, CFG_STALE_ORDINARY_MS, BOARD_PH_DIVIDER_TOP_OHM,
+                                BOARD_PH_DIVIDER_BOTTOM_OHM};
+  float x;
+  uint32_t ageMs;
+  const CaptureStatus st = calCaptureFromSnapshot(cmd->sensor, &s_scratch.snap, monoNowMs(), &limits, &x, &ageMs);
+  if (st != CAPTURE_OK) {
+    sendError(cmd->id, st == CAPTURE_UNSUPPORTED ? PROTOCOL_ERR_BAD_FIELD : PROTOCOL_ERR_STALE, generation);
+    return;
+  }
+  const int32_t scaled = (int32_t)(x * CAL_X_SCALE + (x >= 0.0f ? 0.5f : -0.5f));
+  if (protocolEncodeCapture(cmd->sensor, scaled, ageMs, s_data, sizeof(s_data)) > 0) {
+    sendResultFrame(protocolEncodeResultOk(cmd->id, s_data, payload(), FRAME_MAX_PAYLOAD), generation);
+  }
+}
+
+static void handleCommand(size_t len, uint32_t generation) {
+  Command cmd;
+  const ProtocolError error = protocolParseCommand(s_command, len, &cmd);
+  STATS_ADD(commands, 1);
+  if (error != PROTOCOL_OK) {
+    STATS_ADD(commandErrors, 1);
+    logPrintf(LOG_LEVEL_INFO, "ble: command ? -> %s", protocolErrorName(error));
+    sendError(cmd.id, error, generation);
+    return;
+  }
+  logPrintf(LOG_LEVEL_INFO, "ble: command %s", commandOpName(cmd.op));  // never the fields (set_wifi)
+  if (cmd.op == CMD_OP_GET_SENSORS) {
+    configurationPeekApplied(&s_cfg);
+    if (protocolEncodeSensorList(s_cfg.sensorEnabled, s_data, sizeof(s_data)) > 0) {
+      sendResultFrame(protocolEncodeResultOk(cmd.id, s_data, payload(), FRAME_MAX_PAYLOAD), generation);
+    }
+    return;
+  }
+  if (cmd.op == CMD_OP_GET_CALIBRATION) {
+    configurationPeekApplied(&s_cfg);
+    const CalibrationView v = {s_cfg.ph, s_cfg.tds, s_cfg.light, s_cfg.calOverridden};
+    if (protocolEncodeCalibration(&v, s_data, sizeof(s_data)) > 0) {
+      sendResultFrame(protocolEncodeResultOk(cmd.id, s_data, payload(), FRAME_MAX_PAYLOAD), generation);
+    }
+    return;
+  }
+  if (cmd.op == CMD_OP_CAL_CAPTURE) {
+    handleCapture(&cmd, generation);
+    return;
+  }
+  const int slot = claimSlot(&cmd, generation);
+  if (slot < 0) {
+    sendBusy(cmd.id, generation);
+    return;
+  }
+  const MonoMs expires = monoNowMs() + BLE_COMMAND_TTL_MS;
+  bool queued;
+  if (cmd.op == CMD_OP_RESET_LATCH) {
+    const SafetyCommand sc = {SAFETY_CMD_RESET_LATCH, cmd.rule, expires, tagOf(slot)};
+    queued = safetySubmitCommand(&sc, onSafetyResult, NULL);
+  } else {
+    memset(&s_req, 0, sizeof(s_req));
+    s_req.tag = tagOf(slot);
+    s_req.session = generation;
+    s_req.sessionNow = sessionNow;
+    s_req.expiresMs = expires;
+    s_req.reply = onConfigResult;
+    switch (cmd.op) {
+      case CMD_OP_SET_SENSOR_ENABLED:
+        s_req.kind = CONFIG_REQ_SET_SENSOR_ENABLED;
+        s_req.sensor = cmd.sensor;
+        s_req.enabled = cmd.enabled;
+        break;
+      case CMD_OP_SET_WIFI:
+        s_req.kind = CONFIG_REQ_SET_WIFI;
+        memcpy(s_req.ssid, cmd.ssid, sizeof(s_req.ssid));
+        memcpy(s_req.password, cmd.password, sizeof(s_req.password));
+        break;
+      case CMD_OP_FORGET_WIFI: s_req.kind = CONFIG_REQ_FORGET_WIFI; break;
+      case CMD_OP_SET_CALIBRATION:
+        s_req.kind = CONFIG_REQ_SET_CALIBRATION;
+        s_req.sensor = cmd.sensor;
+        s_req.calX1 = cmd.calX1;
+        s_req.calY1 = cmd.calY1;
+        s_req.calX2 = cmd.calX2;
+        s_req.calY2 = cmd.calY2;
+        break;
+      default:
+        s_req.kind = CONFIG_REQ_RESET_CALIBRATION;
+        s_req.sensor = cmd.sensor;
+        break;
+    }
+    queued = configurationSubmit(&s_req);
+    memset(s_req.password, 0, sizeof(s_req.password));
+  }
+  memset(cmd.password, 0, sizeof(cmd.password));
+  if (!queued) {
+    s_pending[slot].used = false;
+    sendBusy(cmd.id, generation);
+  }
+}
+
+static void drainRx(uint32_t generation) {
+  uint8_t chunk[128];
+  size_t got;
+  while ((got = xStreamBufferReceive(s_rx, chunk, sizeof(chunk), 0)) > 0) {
+    size_t offset = 0;
+    while (offset < got) {
+      size_t used;
+      const uint8_t* framePayload;
+      size_t payloadLen;
+      const FrameStatus status =
+          frameAssemblerFeed(&s_assembler, &chunk[offset], got - offset, &used, &framePayload, &payloadLen);
+      offset += used;
+      if (status == FRAME_READY) {
+        memcpy(s_command, framePayload, payloadLen);  // replies reuse s_frame
+        handleCommand(payloadLen, generation);
+      } else if (status == FRAME_ERROR) {
+        STATS_ADD(commandErrors, 1);
+        logPrintf(LOG_LEVEL_WARN, "ble: bad frame length from client, buffer dropped");
+      }
+    }
+  }
+}
+
+static void drainResults(uint32_t generation) {
+  BleResult r;
+  while (xQueueReceive(s_results, &r, 0) == pdTRUE) {
+    const uint32_t slot = r.tag & 0xFFu;
+    if (slot >= BLE_PENDING) continue;
+    Pending* p = &s_pending[slot];
+    if (!p->used || p->seq != (r.tag >> 8)) continue;  // freed already: a late reply
+    p->used = false;
+    if (p->generation != generation) continue;  // asked on an earlier link: never answered on this one
+    if (r.error != PROTOCOL_OK) {
+      sendError(p->id, r.error, generation);
+      logPrintf(LOG_LEVEL_INFO, "ble: %s -> %s", commandOpName(p->op), protocolErrorName(r.error));
+      continue;
+    }
+    if (p->op == CMD_OP_SET_SENSOR_ENABLED || p->op == CMD_OP_SET_CALIBRATION ||
+        p->op == CMD_OP_RESET_CALIBRATION) {
+      snprintf(s_data, sizeof(s_data), "{\"applied\":true,\"cfg_rev\":%u}", (unsigned)r.cfgRev);
+    } else if (p->op == CMD_OP_RESET_LATCH) {
+      snprintf(s_data, sizeof(s_data), "{\"applied\":true}");
+    } else {
+      snprintf(s_data, sizeof(s_data), "{\"stored\":true}");
+    }
+    logPrintf(LOG_LEVEL_INFO, "ble: %s -> ok", commandOpName(p->op));
+    sendResultFrame(protocolEncodeResultOk(p->id, s_data, payload(), FRAME_MAX_PAYLOAD), generation);
+  }
+}
+
+// A link change orphans every request of the old link (Configuration drops
+// stale-session requests without replying); a reply that never comes frees
+// its slot after BLE_PENDING_LIMIT_MS.
+static void expirePending(uint32_t generation, MonoMs now) {
+  for (int i = 0; i < BLE_PENDING; ++i) {
+    Pending* p = &s_pending[i];
+    if (p->used && (p->generation != generation || now - p->sinceMs > BLE_PENDING_LIMIT_MS)) p->used = false;
+  }
+}
+
+static void sendEvents(uint32_t generation) {
+  JournalEvent e;
+  bool gap;
+  while (safetyJournalNext(&s_journalCursor, &e, &gap)) {
+    if (!sendFrame(BLE_CHANNEL_RESULT, transportEncodeEvent(&e, gap, payload(), FRAME_MAX_PAYLOAD), generation)) {
+      STATS_ADD(resultsDropped, 1);
+      break;  // the cursor reports a gap if the journal overruns meanwhile
+    }
+  }
+}
+
+static void logStats(void) {
+  BleGattStats g;
+  BleTransportStats t;
+  bleGattGetStats(&g);
+  bleTransportGetStats(&t);
+  logPrintf(LOG_LEVEL_INFO, "ble: secure=%d bonds=%d conn=%lu disc=%lu pair ok=%lu rej=%lu | frames %lu tlmDrop %lu "
+            "resDrop %lu busy %lu maxSend %lums notifyFail %lu",
+            bleGattSecure(), bleGattBondCount(), (unsigned long)g.connects, (unsigned long)g.disconnects,
+            (unsigned long)g.pairingsAccepted, (unsigned long)g.pairingsRejected, (unsigned long)t.framesSent,
+            (unsigned long)t.telemetryDropped, (unsigned long)t.resultsDropped, (unsigned long)t.busy,
+            (unsigned long)t.maxSendMs, (unsigned long)g.notifyFailures);
+}
+
+// ---- Task ------------------------------------------------------------------------------
+static void bleTask(void* arg) {
+  (void)arg;
+  if (esp_task_wdt_add(NULL) != ESP_OK) logPrintf(LOG_LEVEL_ERROR, "ble: task watchdog add failed");
+  logPrintf(LOG_LEVEL_WARN, "ble: PAIRING PASSKEY %06lu (bonded owners: %d)", (unsigned long)bleGattPasskey(),
+            bleGattBondCount());
+
+  uint32_t generation = bleGattGeneration();
+  MonoMs nextState = 0, nextTelemetry = 0, nextStats = monoNowMs() + BLE_STATS_LOG_MS, bootPressedAt = 0;
+  bool wasSecure = false, bondsCleared = false;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BLE_WAKE_MS));
+    const MonoMs now = monoNowMs();
+
+    if (bleGattGeneration() != generation) {  // new session: drop half-received commands
+      generation = bleGattGeneration();
+      frameAssemblerReset(&s_assembler);
+      xStreamBufferReset(s_rx);
+    }
+    expirePending(generation, now);
+    const bool secure = bleGattSecure();
+    if (secure != wasSecure) {
+      logPrintf(LOG_LEVEL_INFO, "ble: %s", secure ? "owner connected (secure)" : "link closed");
+      wasSecure = secure;
+      if (secure) {
+        nextState = now;  // State at once
+        safetyJournalCursorInit(&s_journalCursor);  // events from now on, not history
+      }
+    }
+
+    // Priority: commands and their results, alarm events, State, Telemetry.
+    if (secure) drainRx(generation);
+    drainResults(generation);
+    if (secure) sendEvents(generation);
+    if (now >= nextState) {
+      publishState(secure, generation);
+      nextState = now + CFG_BLE_STATE_PERIOD_MS;
+    }
+    if (secure && now >= nextTelemetry) {
+      publishTelemetry(generation);
+      nextTelemetry = now + CFG_BLE_TELEMETRY_PERIOD_MS;
+    }
+
+    // Owner recovery: BOOT held 10 s while running (not at reset: strap pin).
+    if (digitalRead(BLE_BOOT_PIN) == LOW) {
+      if (bootPressedAt == 0) bootPressedAt = now;
+      if (!bondsCleared && now - bootPressedAt >= BLE_BOND_CLEAR_MS) {
+        bleGattClearBonds();
+        logPrintf(LOG_LEVEL_WARN, "ble: BOOT held 10 s - all bonds cleared, pair again with the passkey");
+        bondsCleared = true;
+      }
+    } else {
+      bootPressedAt = 0;
+      bondsCleared = false;
+    }
+
+    if (now >= nextStats) {
+      logStats();
+      nextStats = now + BLE_STATS_LOG_MS;
+    }
+    progressMark(TASK_ID_BLE_TRANSPORT);
+    esp_task_wdt_reset();
+  }
+}
+
+bool bleTransportInit(void) {
+  if (s_task != NULL) return true;
+  s_rx = xStreamBufferCreateStatic(BLE_RX_BYTES, 1, s_rxStorage, &s_rxStruct);
+  s_results = xQueueCreateStatic(BLE_PENDING, sizeof(BleResult), s_resultStorage, &s_resultControl);
+  if (s_rx == NULL || s_results == NULL) return false;
+  frameAssemblerInit(&s_assembler);
+  pinMode(BLE_BOOT_PIN, INPUT_PULLUP);
+  if (!bleGattStart(BLE_NODE_NAME, onRx, NULL)) {
+    logPrintf(LOG_LEVEL_ERROR, "ble: NimBLE failed to start");
+    return false;
+  }
+  publishState(false, bleGattGeneration());  // also fixes the shared boot id (radio running)  // readable State before the first client
+
+  const TaskSpec* spec = cfgTaskSpec(TASK_ID_BLE_TRANSPORT);
+  if (spec->stackBytes != sizeof(s_stack)) {
+    logPrintf(LOG_LEVEL_WARN, "ble: stack %u B, task table says %lu B", (unsigned)sizeof(s_stack),
+              (unsigned long)spec->stackBytes);
+  }
+  s_task = xTaskCreateStaticPinnedToCore(bleTask, spec->name, sizeof(s_stack), NULL, spec->priority, s_stack,
+                                         &s_tcb, spec->core);
+  if (s_task == NULL) return false;
+  TaskHandle_t host = xTaskGetHandle("nimble_host");
+  logPrintf(LOG_LEVEL_INFO, "ble: started (core %u, prio %u), NimBLE host core %d prio %u",
+            (unsigned)spec->core, (unsigned)spec->priority, host != NULL ? (int)xTaskGetAffinity(host) : -1,
+            host != NULL ? (unsigned)uxTaskPriorityGet(host) : 0u);
+  return true;
+}
+
+void bleTransportGetStats(BleTransportStats* out) {
+  portENTER_CRITICAL(&s_statsMux);
+  *out = s_stats;
+  portEXIT_CRITICAL(&s_statsMux);
+}
+
+void* bleTransportTaskHandle(void) { return s_task; }
+
+#endif  // FW_ENABLE_BLE

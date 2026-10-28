@@ -32,7 +32,7 @@ enum {
   METRIC_AIR_HUMIDITY,         // BME280
   METRIC_AIR_PRESSURE,         // BME280
   METRIC_WATER_TEMPERATURE,    // DS18B20
-  METRIC_LIGHT_LEVEL,          // DFR0026 (mV until calibrated)
+  METRIC_LIGHT_LEVEL,          // DFR0026 (mV until calibrated, then lux)
   METRIC_WATER_DISTANCE,       // HC-SR04
   METRIC_PH,                   // pH-4502C
   METRIC_TDS,                  // SEN0244
@@ -52,5 +52,6 @@ enum {
   UNIT_PH,
   UNIT_PPM,
   UNIT_ADC_RAW,
-  UNIT_PPB
+  UNIT_PPB,
+  UNIT_LUX   // light after an on-device fit (WP8 calibration). Appended: values above unchanged
 };

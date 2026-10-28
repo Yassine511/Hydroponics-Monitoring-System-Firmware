@@ -6,7 +6,8 @@
 
 // 64-bit stamps are written as two 32-bit halves: a reader on the other core
 // could see a torn value without the lock (§11).
-// TODO(WP9): track expected membership for the inactive acquisition worker.
+// The acquisition worker without the lease marks nothing; Supervisor checks
+// only the lease holder (acquisitionActiveTaskId(), WP9).
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static MonoMs s_lastMs[TASK_ID_COUNT];
 

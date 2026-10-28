@@ -3,6 +3,7 @@
 #include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "app_config.h"
@@ -24,11 +25,13 @@
 #include "hal/onewire_bus.h"
 #include "hal/pulse_capture.h"
 #include "policy_config.h"
+#include "services/configuration.h"
+#include "services/flash_gate.h"
 #include "services/rail_state.h"
 #include "services/safety.h"
 #include "services/snapshot_store.h"
 
-// ---- Buses and drivers: owned by AcqNormal only (§11) ------------------------
+// ---- Buses and drivers: owned by the lease holder only (§11, §14) ------------
 static I2cBus s_i2c = I2C_BUS_INIT;
 static OneWireBus s_oneWire = ONE_WIRE_BUS_INIT;
 static AdcChannel s_adcLight = ADC_CHANNEL_INIT;
@@ -39,13 +42,14 @@ static PulseCapture s_capture = PULSE_CAPTURE_INIT;
 static Bme280Config s_bmeConfig = {&s_i2c, BOARD_BME280_I2C_ADDRESS};
 static Sgp30Config s_sgpConfig = {&s_i2c, BOARD_SGP30_I2C_ADDRESS};
 static Ds18b20Config s_dsConfig = {&s_oneWire};
-static LightConfig s_lightConfig = {&s_adcLight};
-static TdsConfig s_tdsConfig = {&s_adcTds, {1.0f, 0.0f, 0, false}};  // nominal curve (D13)
+// Calibrations come from the applied configuration: copied in
+// acquisitionInit(), then pushed to the drivers whenever a new revision is
+// applied (on-device calibration, applyConfiguration()).
+static LightConfig s_lightConfig = {&s_adcLight, {1.0f, 0.0f, 0, false}};
+static TdsConfig s_tdsConfig = {&s_adcTds, {1.0f, 0.0f, 0, false}};
 static PhConfig s_phConfig = {&s_adcPh, BOARD_PH_DIVIDER_TOP_OHM, BOARD_PH_DIVIDER_BOTTOM_OHM,
-                              {POLICY_PH_NOMINAL_PH_PER_MV,
-                               7.0f - POLICY_PH_NOMINAL_PH_PER_MV * POLICY_PH_NOMINAL_MV_AT_PH7,
-                               0, true},
-                              true};  // provisional fit: published UNCALIBRATED
+                              {0.0f, 0.0f, 0, false},
+                              true};  // compiled nominal fit: published UNCALIBRATED
 static Hcsr04Config s_hcConfig = {&s_capture, CFG_HCSR04_TIMEOUT_MS};
 
 static Bme280Driver s_bme;
@@ -69,6 +73,8 @@ typedef struct DriverRun {
   MonoMs nextPollMs;
   MonoMs retryAtMs;        // earliest init() retry after a failure
   DriverStatus lastFailure;  // DRIVER_OK = none; logged on change only
+  bool disabled;           // off by the configuration (WP8) or the lease (WP9): never scheduled
+  uint32_t startEpoch;     // 5 V sensors: rail epoch when the measurement started
 } DriverRun;
 
 // Worst-case blocking from each driver header (§16 budgets).
@@ -91,6 +97,13 @@ static const uint8_t kFrameOrder[] = {RUN_DS18B20, RUN_SGP30, RUN_HCSR04, RUN_TD
 enum { JOB_FRAME = 0, JOB_BME280, JOB_COUNT };
 static ScheduleJob s_jobs[JOB_COUNT];
 
+// ---- Applied configuration (WP8): read at frame boundaries only ---------------
+static uint16_t s_appliedRevision;  // stamped into every Reading as configRevision
+static ConfigBlob s_cfg;            // task-private copy (static: not on the stack)
+#define BASELINE_OFFER_PERIOD_MS ((MonoMs)60 * 60 * 1000)  // Configuration rate-limits the write too
+static MonoMs s_nextBaselineOfferMs;
+static volatile Sgp30BaselineStatus s_sgpBaseline = SGP30_BASELINE_NONE;  // one writer, word-sized
+
 // ---- Working snapshot and rule state (task-private) --------------------------
 static Snapshot s_work;
 static AlarmRuleState s_ruleState[POLICY_RULE_COUNT];
@@ -101,6 +114,21 @@ static AcquisitionStats s_stats;
 static StaticTask_t s_tcb;
 static StackType_t s_stack[4 * 1024];  // cfgTaskSpec(TASK_ID_ACQUISITION_NORMAL)->stackBytes
 static TaskHandle_t s_task = NULL;
+static StaticTask_t s_tcbLow;
+static StackType_t s_stackLow[4 * 1024];  // cfgTaskSpec(TASK_ID_ACQUISITION_LOW_POWER)->stackBytes
+static TaskHandle_t s_taskLow = NULL;
+
+// ---- Lease (WP9, §14) ------------------------------------------------------------
+// Everything above is shared by the two workers but touched only by the lease
+// holder; the lock below orders the hand-over between the cores.
+static portMUX_TYPE s_leaseMux = portMUX_INITIALIZER_UNLOCKED;
+static PowerWorker s_owner = POWER_WORKER_NONE;
+static uint32_t s_leaseGen;
+static SensorMask s_allowed = SENSOR_MASK_ALL;
+static uint32_t s_quiesceGen;   // requested, for the current lease
+static uint32_t s_releasedGen;
+static volatile bool s_halsReady;
+static bool s_forceApply;       // a new holder applies the configuration at once
 
 #define STATS_ADD(field, n)        \
   do {                             \
@@ -130,11 +158,35 @@ static void evaluateRules(const Reading* r, MonoMs now) {
   }
 }
 
+// Sensors on the external, switched 5 V rail (§14): gated on the rail epoch.
+static bool onFiveVoltRail(const DriverRun* run) {
+  const SensorId s = sensorDriverId(run->driver);
+  return s == SENSOR_HCSR04 || s == SENSOR_PH || s == SENSOR_TDS;
+}
+
+// Every metric of the run's sensor shows `health` now (no new sample: the
+// sequence is unchanged and telemetry sends a null value).
+static void markSensor(const DriverRun* run, Health health, MonoMs now) {
+  const SensorId s = sensorDriverId(run->driver);
+  for (uint8_t m = 0; m < METRIC_COUNT; ++m) {
+    if (sensorOfMetric((MetricId)m) != s) continue;
+    Reading* r = &s_work.readings[m];
+    r->health = health;
+    r->intervalStartMs = now;
+    r->intervalEndMs = now;
+    r->powerEpoch = railStateRead().epoch;
+  }
+}
+
 // Stamp, store, check rules, for every reading the driver returned.
 static void storeResults(DriverRun* run, MonoMs now, bool guardTimeout) {
   Reading out[4];
   const uint8_t n = sensorDriverReadResult(run->driver, out, 4);
-  const uint32_t epoch = railStateRead().epoch;
+  const RailState rail = railStateRead();
+  const uint32_t epoch = rail.epoch;
+  // The rail went down (or down and up) during the measurement: the number
+  // may come from a collapsing supply, so it is never published (§14).
+  const bool railLost = onFiveVoltRail(run) && (!rail.valid5v || rail.epoch != run->startEpoch);
   for (uint8_t k = 0; k < n; ++k) {
     Reading* r = &out[k];
     if (r->metric >= METRIC_COUNT) continue;
@@ -143,8 +195,9 @@ static void storeResults(DriverRun* run, MonoMs now, bool guardTimeout) {
       r->qualityFlags = (uint16_t)(r->qualityFlags | kQualityLate);
       r->intervalEndMs = now;
     }
+    if (railLost) r->health = HEALTH_UNPOWERED;
     r->powerEpoch = epoch;
-    r->configRevision = 0;
+    r->configRevision = s_appliedRevision;
     s_work.readings[r->metric] = *r;
     evaluateRules(r, now);
   }
@@ -166,8 +219,14 @@ static void noteRecovered(DriverRun* run) {
   logPrintf(LOG_LEVEL_INFO, "acq: %s OK", sensorDriverName(run->driver));
 }
 
+// The HC-SR04 ping holds the flash gate from start to result (flash_gate.h).
+static void releasePingGate(const DriverRun* run) {
+  if (run == &s_runs[RUN_HCSR04]) flashGateGiveAfterPing();
+}
+
 static void finishRun(DriverRun* run, MonoMs now, DriverStatus st) {
   run->pending = false;
+  releasePingGate(run);
   if (st == DRIVER_READY) {
     noteRecovered(run);
   } else {
@@ -184,6 +243,7 @@ static void finishRun(DriverRun* run, MonoMs now, DriverStatus st) {
 static void guardTimeout(DriverRun* run, MonoMs now) {
   sensorDriverCancel(run->driver);
   run->pending = false;
+  releasePingGate(run);
   noteFailure(run, DRIVER_TIMEOUT, "guard");
   STATS_ADD(guardTimeouts, 1);
   storeResults(run, now, true);
@@ -227,6 +287,15 @@ static void prepareInputs(uint8_t runId, MonoMs now) {
 static bool tryStart(uint8_t runId, MonoMs now) {
   DriverRun* run = &s_runs[runId];
   if (runId == RUN_HCSR04 && !pingAllowed(now)) return false;
+  if (onFiveVoltRail(run)) {
+    const RailState rail = railStateRead();
+    if (!rail.valid5v) {  // no 5 V: no init, no conversion of a dead output
+      markSensor(run, HEALTH_UNPOWERED, now);
+      run->wantStart = false;
+      return true;
+    }
+    run->startEpoch = rail.epoch;
+  }
   if (!run->initialised) {
     if (!monoReached(now, run->retryAtMs)) {  // back-off: skip this period
       run->wantStart = false;
@@ -245,6 +314,8 @@ static bool tryStart(uint8_t runId, MonoMs now) {
     now = monoNowMs();  // init may have taken tens of ms
   }
   if (!blockingAllowed(runId, run->stepBudgetMs, now)) return false;
+  // No NVS write may overlap the echo window: defer the ping while one runs.
+  if (runId == RUN_HCSR04 && !flashGateTryTakeForPing()) return false;
   prepareInputs(runId, now);
   run->wantStart = false;
   const DriverStatus st = sensorDriverStart(run->driver, now);
@@ -274,7 +345,74 @@ static bool tryPoll(uint8_t runId, MonoMs now) {
 
 // ---- Frame and slot boundaries ---------------------------------------------------
 
+// pH is provisional (UNCALIBRATED in pH units) until the user fits it on the
+// device; the compiled nominal fit is never buffer-verified (D13).
+static bool phProvisional(const ConfigBlob* cfg) { return (cfg->calOverridden & CAL_BIT_PH) == 0; }
+
+// Drivers keep a private copy of their config: hand them the applied fits.
+// A window in progress finishes with the old fit (its x is already taken).
+static void applyCalibrations(const ConfigBlob* cfg) {
+  phDriverSetCalibration(&s_ph, &cfg->ph, phProvisional(cfg));
+  tdsDriverSetCalibration(&s_tds, &cfg->tds);
+  lightDriverSetCalibration(&s_light, &cfg->light);
+}
+
+// Sensor on/off and calibration changes take effect here, between frames, by
+// this task only: no other task ever touches a driver (§17).
+static SensorMask allowedSensors(void) {
+  portENTER_CRITICAL(&s_leaseMux);
+  const SensorMask allowed = s_allowed;
+  portEXIT_CRITICAL(&s_leaseMux);
+  return allowed;
+}
+
+static void applyConfiguration(MonoMs now) {
+  configurationPeekApplied(&s_cfg);
+  if (s_cfg.revision == s_appliedRevision && !s_forceApply) return;
+  s_forceApply = false;
+  applyCalibrations(&s_cfg);
+  const SensorMask allowed = allowedSensors();
+  for (uint8_t i = 0; i < RUN_COUNT; ++i) {
+    DriverRun* run = &s_runs[i];
+    const SensorId id = sensorDriverId(run->driver);
+    const bool wanted = sensorMaskHas(s_cfg.sensorEnabled, id);
+    const bool enabled = wanted && sensorMaskHas(allowed, id);
+    if (wanted && !enabled) markSensor(run, HEALTH_UNPOWERED, now);  // low power: its rail is off
+    if (!enabled && !run->disabled) {
+      if (run->pending) {
+        sensorDriverCancel(run->driver);  // no preparePowerOff: the shared I2C bus stays in use
+        run->pending = false;
+        releasePingGate(run);
+      }
+      run->disabled = true;
+      run->wantStart = false;
+      logPrintf(LOG_LEVEL_INFO, "acq: %s disabled", sensorDriverName(run->driver));
+    } else if (enabled && run->disabled) {
+      run->disabled = false;
+      run->initialised = false;  // init again at its next due time
+      run->retryAtMs = now;
+      run->lastFailure = DRIVER_OK;
+      markSensor(run, HEALTH_WARMING, now);  // until its first result (§13 restore)
+      logPrintf(LOG_LEVEL_INFO, "acq: %s enabled", sensorDriverName(run->driver));
+    }
+  }
+  s_appliedRevision = s_cfg.revision;
+  configurationAckApplied(s_appliedRevision);
+}
+
+static void offerBaseline(MonoMs now) {
+  if (now < s_nextBaselineOfferMs) return;
+  s_nextBaselineOfferMs = now + BASELINE_OFFER_PERIOD_MS;
+  uint16_t co2eq, tvoc;
+  if (!s_runs[RUN_SGP30].disabled && sgp30DriverGetBaseline(&s_sgp, &co2eq, &tvoc)) {
+    configurationOfferBaseline(co2eq, tvoc);
+  }
+}
+
 static void startFrame(MonoMs now) {
+  applyConfiguration(now);
+  offerBaseline(now);
+  s_sgpBaseline = sgp30DriverBaselineStatus(&s_sgp);
   ScheduleJob* job = &s_jobs[JOB_FRAME];
   const uint32_t lateBefore = job->late;
   const uint32_t skippedBefore = job->skipped;
@@ -285,7 +423,7 @@ static void startFrame(MonoMs now) {
   for (uint8_t i = 0; i < FRAME_ORDER_COUNT; ++i) {
     DriverRun* run = &s_runs[kFrameOrder[i]];
     if (run->pending) guardTimeout(run, now);
-    run->wantStart = true;
+    run->wantStart = !run->disabled;
   }
 
   ++s_work.frameSequence;
@@ -306,7 +444,9 @@ static void startBmeSlot(MonoMs now) {
   const uint32_t skippedBefore = job->skipped;
   scheduleJobMarkRun(job, now);
   if (s_runs[RUN_BME280].pending) guardTimeout(&s_runs[RUN_BME280], now);
-  s_runs[RUN_BME280].wantStart = true;
+  // A disabled BME280 keeps its slot grid: blocking steps still respect it
+  // (scheduleFitsBefore), which is conservative but never wrong.
+  s_runs[RUN_BME280].wantStart = !s_runs[RUN_BME280].disabled;
   portENTER_CRITICAL(&s_statsMux);
   s_stats.bmeLate += job->late - lateBefore;
   s_stats.bmeSkipped += job->skipped - skippedBefore;
@@ -348,9 +488,9 @@ static MonoMs nextWake(MonoMs now) {
   return due;
 }
 
-static void acqTask(void* arg) {
-  (void)arg;
-  // HALs begin here, on core 1: the echo ISR is installed on this core.
+// HALs begin in AcqNormal, on core 1: the echo ISR (and with it the GPIO ISR
+// service the power-sense ISR shares) is installed on this core.
+static void beginHals(void) {
   if (!i2cBusBegin(&s_i2c, BOARD_PIN_I2C_SDA, BOARD_PIN_I2C_SCL, BOARD_I2C_CLOCK_HZ)) {
     logPrintf(LOG_LEVEL_ERROR, "acq: I2C begin failed");
   }
@@ -361,20 +501,105 @@ static void acqTask(void* arg) {
   if (!pulseCaptureBegin(&s_capture, BOARD_PIN_HCSR04_TRIG, BOARD_PIN_HCSR04_ECHO)) {
     logPrintf(LOG_LEVEL_ERROR, "acq: HC-SR04 capture failed");
   }
+}
 
-  const MonoMs t0 = monoNowMs();
-  scheduleJobInit(&s_jobs[JOB_FRAME], CFG_FRAME_PERIOD_MS, CFG_FRAME_RESERVATION_MS, t0);
-  scheduleJobInit(&s_jobs[JOB_BME280], CFG_BME280_PERIOD_MS, CFG_BME280_BUDGET_MS, t0);
+static TaskHandle_t workerTask(PowerWorker w) { return w == POWER_WORKER_LOW ? s_taskLow : s_task; }
 
-  // Task watchdog (§18): this task resets it for itself after each pass. A
-  // pass happens at least every 250 ms (BME280 slot), so 5 s of silence means
-  // the task is stuck inside a call.
+static bool holdsLease(PowerWorker me) {
+  portENTER_CRITICAL(&s_leaseMux);
+  const bool mine = s_owner == me;
+  portEXIT_CRITICAL(&s_leaseMux);
+  return mine;
+}
+
+static bool quiesceRequested(void) {
+  portENTER_CRITICAL(&s_leaseMux);
+  const bool requested = s_quiesceGen != 0 && s_quiesceGen == s_leaseGen;
+  portEXIT_CRITICAL(&s_leaseMux);
+  return requested;
+}
+
+// New holder: join the task watchdog, restart the schedule from now (the
+// previous holder's deadlines are not ours to count as late) and apply the
+// configuration within the allowed sensors at the first frame.
+static void acquireLease(PowerWorker me, MonoMs now) {
   if (esp_task_wdt_add(NULL) != ESP_OK) logPrintf(LOG_LEVEL_ERROR, "acq: task watchdog add failed");
+  scheduleJobInit(&s_jobs[JOB_FRAME], CFG_FRAME_PERIOD_MS, CFG_FRAME_RESERVATION_MS, now);
+  scheduleJobInit(&s_jobs[JOB_BME280], CFG_BME280_PERIOD_MS, CFG_BME280_BUDGET_MS, now);
+  for (uint8_t i = 0; i < RUN_COUNT; ++i) {
+    s_runs[i].pending = false;
+    s_runs[i].wantStart = false;
+  }
+  s_forceApply = true;
+  progressMark(me == POWER_WORKER_NORMAL ? TASK_ID_ACQUISITION_NORMAL : TASK_ID_ACQUISITION_LOW_POWER);
+  logPrintf(LOG_LEVEL_INFO, "acq: %s worker holds the lease (gen %lu, sensors 0x%02x)",
+            me == POWER_WORKER_NORMAL ? "normal" : "low-power", (unsigned long)s_leaseGen,
+            (unsigned)allowedSensors());
+}
 
+// QUIESCE -> RELEASED (§14): nothing is left running, the 5 V interfaces are
+// safe if their rail is down, and the worker never touches a driver again
+// until the next grant.
+static void releaseLease(PowerWorker me) {
+  const bool railDown = !railStateRead().valid5v;
+  for (uint8_t i = 0; i < RUN_COUNT; ++i) {
+    DriverRun* run = &s_runs[i];
+    if (run->pending) {
+      sensorDriverCancel(run->driver);
+      run->pending = false;
+      releasePingGate(run);
+    }
+    run->wantStart = false;
+    if (railDown && onFiveVoltRail(run)) {
+      sensorDriverPreparePowerOff(run->driver);  // HC-SR04: TRIG held low, no drive into a dead module
+      run->initialised = false;
+    }
+  }
+  snapshotPublish(&s_work);
+  esp_task_wdt_delete(NULL);  // a blocked worker owes the watchdog nothing
+  portENTER_CRITICAL(&s_leaseMux);
+  s_owner = POWER_WORKER_NONE;
+  s_releasedGen = s_leaseGen;
+  s_quiesceGen = 0;
+  portEXIT_CRITICAL(&s_leaseMux);
+  logPrintf(LOG_LEVEL_INFO, "acq: %s worker released (gen %lu)", me == POWER_WORKER_NORMAL ? "normal" : "low-power",
+            (unsigned long)s_releasedGen);
+}
+
+static void acqTask(void* arg) {
+  const PowerWorker me = (PowerWorker)(uintptr_t)arg;
+  const TaskId id = me == POWER_WORKER_NORMAL ? TASK_ID_ACQUISITION_NORMAL : TASK_ID_ACQUISITION_LOW_POWER;
+  if (me == POWER_WORKER_NORMAL) {
+    beginHals();
+    s_halsReady = true;
+    portENTER_CRITICAL(&s_leaseMux);
+    const PowerWorker owner = s_owner;
+    portEXIT_CRITICAL(&s_leaseMux);
+    if (owner == POWER_WORKER_LOW && s_taskLow != NULL) xTaskNotifyGive(s_taskLow);  // granted before the HALs
+  }
+  const MonoMs t0 = monoNowMs();
+  (void)t0;
+  bool holding = false;
+
+  // Task watchdog (§18): the holder resets it after each pass. A pass happens
+  // at least every 250 ms (BME280 slot), so 5 s of silence means the task is
+  // stuck inside a call. A worker without the lease is not on the watchdog.
   for (;;) {
+    if (!holding) {
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // a grant (or a stale wake-up)
+      if (!s_halsReady || !holdsLease(me)) continue;
+      holding = true;
+      acquireLease(me, monoNowMs());
+    }
+    if (quiesceRequested()) {
+      releaseLease(me);
+      holding = false;
+      continue;
+    }
     const MonoMs now = monoNowMs();
     const MonoMs due = nextWake(now);
     ulTaskNotifyTake(pdTRUE, due > now ? pdMS_TO_TICKS((uint32_t)(due - now)) : 0);
+    if (quiesceRequested()) continue;  // released at the top, before any new step
     runPass(monoNowMs());
 #ifdef FW_INJECT_STALL_ACQ
     // Acceptance test (§19 "Stall injection"): block forever after N ms.
@@ -383,15 +608,45 @@ static void acqTask(void* arg) {
       vTaskDelay(portMAX_DELAY);
     }
 #endif
-    progressMark(TASK_ID_ACQUISITION_NORMAL);
+    progressMark(id);
     esp_task_wdt_reset();
   }
 }
 
-TaskHandle_t acquisitionTaskHandle(void) { return s_task; }
+TaskHandle_t acquisitionTaskHandle(void) {
+  portENTER_CRITICAL(&s_leaseMux);
+  const PowerWorker owner = s_owner;
+  portEXIT_CRITICAL(&s_leaseMux);
+  return owner == POWER_WORKER_LOW ? s_taskLow : s_task;
+}
+
+TaskHandle_t acquisitionNormalTaskHandle(void) { return s_task; }
+TaskHandle_t acquisitionLowPowerTaskHandle(void) { return s_taskLow; }
+
+static TaskHandle_t createWorker(TaskId id, PowerWorker w, StackType_t* stack, uint32_t stackBytes,
+                                 StaticTask_t* tcb) {
+  const TaskSpec* spec = cfgTaskSpec(id);
+  if (spec->stackBytes != stackBytes) {
+    logPrintf(LOG_LEVEL_WARN, "acq: %s stack %lu B, task table says %lu B", spec->name, (unsigned long)stackBytes,
+              (unsigned long)spec->stackBytes);
+  }
+  TaskHandle_t t = xTaskCreateStaticPinnedToCore(acqTask, spec->name, stackBytes, (void*)(uintptr_t)w,
+                                                 spec->priority, stack, tcb, spec->core);
+  if (t != NULL) {
+    logPrintf(LOG_LEVEL_INFO, "acq: %s started (core %u, prio %u)", spec->name, (unsigned)spec->core,
+              (unsigned)spec->priority);
+  }
+  return t;
+}
 
 bool acquisitionInit(void) {
   if (s_task != NULL) return true;
+  // Applied configuration: calibrations now, the sensor mask at the first frame.
+  configurationPeekApplied(&s_cfg);
+  s_phConfig.calibration = s_cfg.ph;
+  s_phConfig.calibrationProvisional = phProvisional(&s_cfg);
+  s_tdsConfig.calibration = s_cfg.tds;
+  s_lightConfig.calibration = s_cfg.light;
   bme280DriverConstruct(&s_bme, &s_bmeConfig);
   sgp30DriverConstruct(&s_sgp, &s_sgpConfig);
   ds18b20DriverConstruct(&s_ds, &s_dsConfig);
@@ -399,32 +654,81 @@ bool acquisitionInit(void) {
   tdsDriverConstruct(&s_tds, &s_tdsConfig);
   phDriverConstruct(&s_ph, &s_phConfig);
   hcsr04DriverConstruct(&s_hc, &s_hcConfig);
+  uint16_t co2eq, tvoc;
+  if (configurationStoredBaseline(&co2eq, &tvoc)) {
+    sgp30DriverSetBaseline(&s_sgp, co2eq, tvoc);  // restored at the SGP30's init
+    logPrintf(LOG_LEVEL_INFO, "acq: SGP30 baseline restored from NVS");
+  }
+  s_appliedRevision = 0;  // revisions start at 1: forces applyConfiguration() at the first frame
+  s_nextBaselineOfferMs = BASELINE_OFFER_PERIOD_MS;
   snapshotReset(&s_work);
   memset(s_ruleState, 0, sizeof(s_ruleState));
 
-  const TaskSpec* spec = cfgTaskSpec(TASK_ID_ACQUISITION_NORMAL);
-  if (spec->stackBytes != sizeof(s_stack)) {
-    logPrintf(LOG_LEVEL_WARN, "acq: stack %u B, task table says %lu B", (unsigned)sizeof(s_stack),
-              (unsigned long)spec->stackBytes);
+  // No lease yet: PowerCoordinator grants the first one (§14).
+  s_task = createWorker(TASK_ID_ACQUISITION_NORMAL, POWER_WORKER_NORMAL, s_stack, sizeof(s_stack), &s_tcb);
+  s_taskLow = createWorker(TASK_ID_ACQUISITION_LOW_POWER, POWER_WORKER_LOW, s_stackLow, sizeof(s_stackLow),
+                           &s_tcbLow);
+  if (s_taskLow == NULL) logPrintf(LOG_LEVEL_ERROR, "acq: low-power worker missing - no sensing in low power");
+  return s_task != NULL;
+}
+
+bool acquisitionGrant(PowerWorker worker, uint32_t generation, SensorMask allowed) {
+  if (worker != POWER_WORKER_NORMAL && worker != POWER_WORKER_LOW) return false;
+  portENTER_CRITICAL(&s_leaseMux);
+  const bool free = s_owner == POWER_WORKER_NONE;
+  if (free) {
+    s_owner = worker;
+    s_leaseGen = generation;
+    s_allowed = (SensorMask)(allowed & SENSOR_MASK_ALL);
+    s_quiesceGen = 0;
   }
-  s_task = xTaskCreateStaticPinnedToCore(acqTask, spec->name, sizeof(s_stack), NULL,
-                                         spec->priority, s_stack, &s_tcb, spec->core);
-  if (s_task == NULL) return false;
-  logPrintf(LOG_LEVEL_INFO, "acq: started (core %u, prio %u), %u drivers", (unsigned)spec->core,
-            (unsigned)spec->priority, (unsigned)RUN_COUNT);
+  portEXIT_CRITICAL(&s_leaseMux);
+  if (!free) {
+    logPrintf(LOG_LEVEL_ERROR, "acq: grant gen %lu refused - the lease is still held", (unsigned long)generation);
+    return false;
+  }
+  TaskHandle_t t = workerTask(worker);
+  if (t != NULL) xTaskNotifyGive(t);
   return true;
 }
 
-// D15: single worker until WP9; the lease protocol is not implemented yet.
-bool acquisitionGrant(uint32_t generation, uint8_t allowedRailMask) {
-  (void)generation;
-  (void)allowedRailMask;
-  return false;
+bool acquisitionRequestQuiesce(uint32_t generation) {
+  portENTER_CRITICAL(&s_leaseMux);
+  const bool current = s_owner != POWER_WORKER_NONE && s_leaseGen == generation;
+  const PowerWorker owner = s_owner;
+  if (current) s_quiesceGen = generation;
+  portEXIT_CRITICAL(&s_leaseMux);
+  if (!current) return false;
+  TaskHandle_t t = workerTask(owner);
+  if (t != NULL) xTaskNotifyGive(t);  // wakes it from a bounded wait
+  return true;
 }
 
-bool acquisitionRequestQuiesce(uint32_t generation) {
-  (void)generation;
-  return false;
+uint32_t acquisitionReleasedGeneration(void) {
+  portENTER_CRITICAL(&s_leaseMux);
+  const uint32_t gen = s_releasedGen;
+  portEXIT_CRITICAL(&s_leaseMux);
+  return gen;
+}
+
+bool acquisitionHalsReady(void) { return s_halsReady; }
+
+TaskId acquisitionActiveTaskId(void) {
+  portENTER_CRITICAL(&s_leaseMux);
+  const PowerWorker owner = s_owner;
+  portEXIT_CRITICAL(&s_leaseMux);
+  if (owner == POWER_WORKER_NORMAL) return TASK_ID_ACQUISITION_NORMAL;
+  if (owner == POWER_WORKER_LOW) return TASK_ID_ACQUISITION_LOW_POWER;
+  return TASK_ID_COUNT;
+}
+
+const char* acquisitionSgp30BaselineName(void) {
+  switch (s_sgpBaseline) {  // contract v2 spelling (lowercase)
+    case SGP30_BASELINE_LEARNING: return "learning";
+    case SGP30_BASELINE_RESTORED: return "restored";
+    case SGP30_BASELINE_VALID: return "valid";
+    default: return "none";
+  }
 }
 
 void acquisitionGetStats(AcquisitionStats* out) {

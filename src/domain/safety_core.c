@@ -78,6 +78,12 @@ static uint16_t staleRules(const SafetyCore* self, const SafetyInputs* in) {
   for (uint8_t i = 0; i < self->ruleCount; ++i) {
     const AlarmRule* rule = &self->rules[i];
     if (!rule->enabled) continue;
+    // A switched-off input is not monitored, unless its rule is still latched:
+    // then the missing data stays visible until the sensor is back.
+    if (rule->metric < METRIC_COUNT && sensorMaskHas(in->sensorDisabled, sensorOfMetric(rule->metric)) &&
+        !self->rule[i].latched) {
+      continue;
+    }
     const uint32_t limit = alarmStaleLimitMs(rule->metric);
     if (in->snap == NULL || rule->metric >= METRIC_COUNT ||
         !readingIsActionableAt(&in->snap->readings[rule->metric], in->now, limit)) {
@@ -87,10 +93,29 @@ static uint16_t staleRules(const SafetyCore* self, const SafetyInputs* in) {
   return mask;
 }
 
+static void applyCommands(SafetyCore* self, const SafetyInputs* in, SafetyOutputs* out) {
+  if (in->commands == NULL) return;
+  const uint8_t n = in->commandCount > SAFETY_MAX_COMMANDS ? SAFETY_MAX_COMMANDS : in->commandCount;
+  for (uint8_t i = 0; i < n; ++i) {
+    const SafetyCommand* c = &in->commands[i];
+    SafetyCommandResult* r = &out->results[out->resultCount++];
+    r->tag = c->tag;
+    if (in->now > c->expiresMs) {
+      r->outcome = SAFETY_CMD_EXPIRED;
+    } else if (c->kind != SAFETY_CMD_RESET_LATCH || c->ruleId >= self->ruleCount) {
+      r->outcome = SAFETY_CMD_BAD_RULE;
+    } else {
+      r->outcome = safetyCoreResetLatch(self, c->ruleId) ? SAFETY_CMD_APPLIED : SAFETY_CMD_STILL_ACTIVE;
+    }
+  }
+}
+
 void safetyCoreStep(SafetyCore* self, const SafetyInputs* in, SafetyOutputs* out) {
   memset(out, 0, sizeof(*out));
 
-  // 1 Power validity: nothing to invalidate until WP9 (rail epoch).
+  // 1 Power validity (WP9): 5 V readings are already gated on the rail epoch
+  // by acquisition (published UNPOWERED, never actionable); here only the
+  // actuator on that rail is handled (step 5).
 
   // 2 Alarm events.
   const bool trippedNow = applyEvents(self, in);
@@ -99,7 +124,8 @@ void safetyCoreStep(SafetyCore* self, const SafetyInputs* in, SafetyOutputs* out
   LampReason reason = updateLamp(self, in);
   out->staleMask = staleRules(self, in);
 
-  // 4 Commands: none until WP8.
+  // 4 Commands.
+  applyCommands(self, in, out);
 
   // 5 Output.
   bool interlock = trippedNow;
@@ -109,17 +135,19 @@ void safetyCoreStep(SafetyCore* self, const SafetyInputs* in, SafetyOutputs* out
     if (st->active) out->activeMask = (uint16_t)(out->activeMask | (1u << i));
     if ((st->latched || st->active) && isRelayInterlock(&self->rules[i])) interlock = true;
   }
-  if (interlock && self->lamp.on) lampControlForceOff(&self->lamp, in->now);
+  if ((interlock || in->railDown) && self->lamp.on) lampControlForceOff(&self->lamp, in->now);
 
   out->interlock = interlock;
   out->lampWantsOn = self->lamp.on;
   if (interlock) {
     reason = LAMP_REASON_INTERLOCK;
+  } else if (in->railDown) {
+    reason = LAMP_REASON_UNPOWERED;
   } else if (!self->config.lampAutoEnabled) {
     reason = LAMP_REASON_DISABLED;
   }
   out->lampReason = reason;
-  out->relayOn = self->config.lampAutoEnabled && !interlock && self->lamp.on;
+  out->relayOn = self->config.lampAutoEnabled && !interlock && !in->railDown && self->lamp.on;
 }
 
 bool safetyCoreResetLatch(SafetyCore* self, uint8_t ruleId) {
@@ -128,6 +156,17 @@ bool safetyCoreResetLatch(SafetyCore* self, uint8_t ruleId) {
   if (st->active) return false;
   st->latched = false;
   return true;
+}
+
+bool safetyRulesBlockSensor(const AlarmRule* rules, uint8_t ruleCount, uint16_t latchedMask,
+                            uint16_t activeMask, SensorId sensor) {
+  if (rules == NULL) return false;
+  const uint16_t held = (uint16_t)(latchedMask | activeMask);
+  for (uint8_t i = 0; i < ruleCount && i < 16; ++i) {
+    if (!rules[i].enabled || (held & (1u << i)) == 0) continue;
+    if (rules[i].metric < METRIC_COUNT && sensorOfMetric(rules[i].metric) == sensor) return true;
+  }
+  return false;
 }
 
 const char* lampReasonName(LampReason r) {
@@ -139,6 +178,7 @@ const char* lampReasonName(LampReason r) {
     case LAMP_REASON_STALE: return "stale";
     case LAMP_REASON_INTERLOCK: return "interlock";
     case LAMP_REASON_DISABLED: return "disabled";
+    case LAMP_REASON_UNPOWERED: return "no 5 V";
   }
   return "?";
 }

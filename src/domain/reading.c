@@ -76,6 +76,7 @@ const char* unitName(Unit u) {
     case UNIT_PPM: return "ppm";
     case UNIT_ADC_RAW: return "raw";
     case UNIT_PPB: return "ppb";
+    case UNIT_LUX: return "lux";
   }
   return "?";
 }

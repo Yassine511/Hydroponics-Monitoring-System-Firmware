@@ -8,3 +8,6 @@
 
 #define PROTOCOL_FRAME_HEADER_BYTES ((size_t)2)  // little-endian payload length
 #define PROTOCOL_MAX_PAYLOAD_BYTES ((size_t)4096)
+
+// Reported as "fw" in every State frame.
+#define PROTOCOL_FIRMWARE_VERSION "0.9.0"

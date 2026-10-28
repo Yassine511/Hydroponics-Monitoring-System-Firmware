@@ -38,3 +38,34 @@ float trimmedMeanU32(uint32_t* samples, uint8_t n, uint8_t trim) {
   for (uint8_t i = trim; i < n - trim; ++i) sum += samples[i];
   return (float)sum / (float)(n - 2u * trim);
 }
+
+static void invalidFit(uint16_t revision, LinearCalibration* out) {
+  out->slope = 1.0f;
+  out->offset = 0.0f;
+  out->revision = revision;
+  out->valid = false;
+}
+
+bool linearGainFromPoint(float x1, float y1, float minGain, float maxGain, uint16_t revision,
+                         LinearCalibration* out) {
+  invalidFit(revision, out);
+  if (!(x1 > 0.0f) || !(y1 > 0.0f)) return false;
+  const float gain = y1 / x1;
+  if (gain < minGain || gain > maxGain) return false;
+  out->slope = gain;
+  out->valid = true;
+  return true;
+}
+
+bool phFitFromBuffers(float mv1, float ph1, float mv2, float ph2, float minAbsSlope, float maxAbsSlope,
+                      uint16_t revision, LinearCalibration* out) {
+  invalidFit(revision, out);
+  const float dph = ph2 - ph1;
+  if (dph > -1.0f && dph < 1.0f) return false;
+  LinearCalibration fit;
+  if (!linearFromTwoPoints(mv1, ph1, mv2, ph2, revision, &fit)) return false;
+  const float mag = fit.slope < 0.0f ? -fit.slope : fit.slope;
+  if (mag < minAbsSlope || mag > maxAbsSlope) return false;
+  *out = fit;
+  return true;
+}

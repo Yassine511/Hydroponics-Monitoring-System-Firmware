@@ -173,3 +173,7 @@ void tdsDriverConstruct(TdsDriver* self, const TdsConfig* config) {
 void tdsDriverSetWaterTemperature(TdsDriver* self, const Reading* waterTemperature) {
   self->waterTemperature_ = *waterTemperature;
 }
+
+void tdsDriverSetCalibration(TdsDriver* self, const LinearCalibration* calibration) {
+  self->config_.calibration = *calibration;
+}

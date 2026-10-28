@@ -4,8 +4,10 @@
 // Retained 3.3 V rail. S -> 10 kOhm series -> ADC1 pin (GPIO1), 1 uF to GND
 // (tau ~10 ms). No divider: pin mV = module output mV. More light, higher
 // voltage. Datasheet range 1-6000 lux, but the output has no lux unit: the FAQ
-// requires a reference-meter mapping, and types.h has no lux unit yet (D13).
-// So every result is mV, never lux.
+// requires a reference-meter mapping (D13). Without one every result is mV.
+// With an on-device fit (Calibration page: one reference-meter reading, gain
+// through zero) the value is lux. raw stays pin mV either way, and the lamp
+// thresholds use it (lamp_control), so calibrating never moves the lamp.
 //
 // Filter: LIGHT_SAMPLES conversions spaced LIGHT_SAMPLE_SPACING_MS apart,
 // sorted, mean of the middle LIGHT_SAMPLES - 2*LIGHT_TRIM. Mains lamps flicker
@@ -16,7 +18,8 @@
 // due LIGHT_SAMPLE_SPACING_MS after the previous actual sample.
 //
 // Results (poll() returns READY for all; raw = filtered pin mV):
-//   value = module mV, UNIT_MILLIVOLT, HEALTH_UNCALIBRATED
+//   calibration.valid -> value = lux, UNIT_LUX, HEALTH_OK
+//   otherwise         -> value = module mV, UNIT_MILLIVOLT, HEALTH_UNCALIBRATED
 //   any sample clipped -> kQualitySaturated, value kept as a lower bound
 //                         (bright light on a 3.3 V supply can exceed the S3's
 //                         ~3.1 V range; this is not a fault)
@@ -35,13 +38,15 @@
 #pragma once
 #include "drivers/sensor_driver.h"
 #include "hal/adc_channel.h"
+#include "domain/calibration.h"
 
 #define LIGHT_SAMPLES 10
 #define LIGHT_TRIM 2
 #define LIGHT_SAMPLE_SPACING_MS 11
 
 typedef struct LightConfig {
-  AdcChannel* adc;  // already begun on BOARD_PIN_LIGHT_ADC
+  AdcChannel* adc;                // already begun on BOARD_PIN_LIGHT_ADC
+  LinearCalibration calibration;  // x = pin mV, y = lux; invalid = publish mV
 } LightConfig;
 
 // Members after `base` are private to light.c.
@@ -60,3 +65,7 @@ typedef struct LightDriver {
 
 // Constructor. Use &driver.base wherever a SensorDriver* is expected.
 void lightDriverConstruct(LightDriver* self, const LightConfig* config);
+
+// New lux fit from the applied configuration (on-device calibration, WP8).
+// Called by the acquisition owner between windows; applies from the next one.
+void lightDriverSetCalibration(LightDriver* self, const LinearCalibration* calibration);

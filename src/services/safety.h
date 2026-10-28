@@ -2,7 +2,8 @@
 // Work package WP7 (Stage 4). Architecture §11, §12; decisions in
 // domain/safety_core (host-tested). This file only waits, copies and writes.
 //
-// Task: core 0, priority 6 (cfgTaskSpec(TASK_ID_SAFETY)). Wakes on an alarm
+// Task: core 1, priority 6 (cfgTaskSpec(TASK_ID_SAFETY); core 1 since the D14
+// radio-load test, away from the Wi-Fi/BLE/TCP-IP tasks on core 0). Wakes on an alarm
 // event or every CFG_SAFETY_HEALTH_CHECK_MS. Never waits on network I/O,
 // NVS or a mutex. Grow-lamp auto control follows POLICY_LAMP_AUTO_ENABLED.
 #pragma once
@@ -12,6 +13,7 @@
 #include <stdint.h>
 
 #include "domain/alarm.h"
+#include "domain/event_journal.h"
 #include "domain/safety_core.h"
 
 // Creates the detail queue, status mailbox and the task. Relay stays OFF.
@@ -41,6 +43,21 @@ bool safetyStatusPeek(SafetyStatus* out);
 
 // For Supervisor's stack check. NULL before safetyInit().
 TaskHandle_t safetyTaskHandle(void);
+
+// ---- WP8: bounded remote commands (§12 step 4) ------------------------------
+// The outcome is reported from the Safety task after the step that handled
+// the command: the callback must copy and return at once.
+typedef void (*SafetyReplyFn)(uint32_t tag, SafetyCommandOutcome outcome, void* ctx);
+
+// Zero wait. false = command queue full (reply "busy"). command->expiresMs
+// is checked in Safety, never applied late.
+bool safetySubmitCommand(const SafetyCommand* command, SafetyReplyFn reply, void* ctx);
+
+// ---- WP8: alarm event journal (§11) -----------------------------------------
+// TRIP / CLEAR / reset events with independent reader cursors (BLE, LAN).
+// Zero wait, any task. A new cursor sees only events appended after it.
+void safetyJournalCursorInit(JournalCursor* cursor);
+bool safetyJournalNext(JournalCursor* cursor, JournalEvent* out, bool* gap);
 
 #ifdef FW_ALARM_LATENCY_TEST
 // Test build only: acquisition records the esp_timer time (us) at which it

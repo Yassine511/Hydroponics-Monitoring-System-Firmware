@@ -45,7 +45,8 @@ pH and TDS (WP5) and SGP30 (WP6) drivers are written; the others are still stubs
 
 ## Language: C (migrated from C++, October 2026)
 
-All project sources (`src/`, `include/`, `test/`) are C. The module layout, layer
+All project sources (`src/`, `include/`, `test/`) are C, except
+`src/transports/ble_gatt.cpp`: the C++ shim over NimBLE-Arduino, with a C API, from WP8. The module layout, layer
 rules, frozen-contract contents and env names are the same as in the C++ version.
 Runtime behaviour is meant to be unchanged, but it has not yet been re-verified on
 hardware (see "C migration build record" below). The pre-migration C++ tree was
@@ -126,6 +127,13 @@ fields and field order did not. The team lead should review that once.
 
 To change one, open a short review with the team lead. Do not edit them inside a feature branch. Each change needs a hardware or measurement reason.
 
+**Frozen-header change (28 Oct 2026, project owner's decision; team lead to be
+told): `domain/types.h` gains `UNIT_LUX`**, appended after `UNIT_PPB`, so every
+existing unit value is unchanged and `Reading` / `Snapshot` keep their sizes
+(56 / 584 B, checked at compile time). Reason: the light sensor can now be
+calibrated on the device against a lux meter (Calibration page) and then
+publishes lux.
+
 **Contract note (25 Oct 2026, audit D6):** every driver sets
 `Reading.lastGoodMs` for each *usable* result, `HEALTH_OK` or
 `HEALTH_UNCALIBRATED`; the `reading.h` comment says so. Comment-only change:
@@ -142,8 +150,8 @@ no field, order or size change.
 | WP5 | pH + TDS, calibration | `drivers/ph.*`, `drivers/tds.*`, `domain/calibration.*`, `domain/tds_codec.*` | 3 | — (**pH driver + ADC HAL written 17 Oct 2026, builds; not yet run on hardware, uncalibrated** — see "pH-4502C calibration". **TDS driver written 24 Oct 2026, nominal datasheet curve (uncalibrated); running on S3 hardware 24 Oct 2026: air 0 mV, tap ~1245 mV, hot ~1922 mV, salted water over range (FAULT); compensation checked with the DS18B20 in `test_water` (switched to ppm/EC compensation, ~5 % across 11-34 degC); reference solution not yet tested** — see "SEN0244 TDS bring-up") |
 | WP6 | SGP30 air quality (TVOC, CO2eq) on the shared I2C bus | `drivers/sgp30.*`, `domain/sgp30_codec.*`, `hal/i2c_bus.*` (raw write/read), `test/bringup/sgp30_main.c`, `test/bringup/climate_main.c` | 2 | — (**running on S3 hardware 22 Oct 2026: feature set 0x0020 @0x58, 1 s cadence, 13 ms per measurement, no CRC faults; breath and hand-sanitiser spikes seen. Runs with the BME280 on the shared bus in `test_climate`, with humidity compensation. Baseline save/restore, 12 h learning and fault recovery not yet tested**; baseline is RAM-only until WP8 stores it in NVS) |
 | WP7 | Acquisition scheduler, Safety, alarm rules, snapshot | `services/acquisition.*`, `services/safety.*`, `domain/alarm.*`, `domain/schedule.*`, `domain/safety_core.*`, `include/policy_config.h` | 4 | — (**domain logic done 25 Oct 2026**: rule evaluation with hysteresis/persistence/staleness, absolute-deadline job table with skip-not-catch-up, pure Safety state machine with lamp policy, stale → OFF and DEENERGIZE interlock; 41 host tests. **Services written 25 Oct 2026, builds, not yet run on hardware:** AcqNormal runs all 7 drivers as the single worker (D15); Safety task owns the relay (`hal/relay.c`); `main.c` boots safe outputs → logger → Safety → acquisition → Supervisor. Readings are stamped with the rail epoch but **not gated on 5 V validity until WP9**. Thresholds still placeholders: rules ship **disabled** in `policy_config.h`; lamp auto-control **enabled**) |
-| WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*` | 5 | WP7 snapshot |
-| WP9 | Power ISR, rail epoch, lease handover | `services/power_coordinator.*`, `services/rail_state.*` | 6 | — (power sense on GPIO8 measured 25 Oct 2026; ISR must self-disable + 20 ms qualification) |
+| WP8 | Wi-Fi/MQTT, BLE, protocol, configuration, desktop app update | `transports/*`, `services/configuration.*`, `services/flash_gate.*`, `domain/protocol_codec.*`, `domain/frame_codec.*`, `domain/config_blob.*`, `domain/event_journal.*`, `domain/backoff.*`, `domain/sensor_set.*` | 5 | — (**8.0** contract v2 and desktop app v2 done; **Spike A** NimBLE pairing run on hardware 25–27 Oct 2026. **8.1** domain logic done, host-tested. **8.2** Configuration + NVS done and bench-tested 27 Oct 2026 (see "Configuration and NVS"). **8.3** BLE transport in every production image, D14 under BLE passed (see "BLE transport"). **8.4** Wi-Fi station + read-only LAN link written 27 Oct 2026 and bench-tested. **28 Oct 2026, written, not flashed (no circuit):** the LAN link (TCP 47800, mDNS, token ops) is **removed**: the app connects over Bluetooth only and Wi-Fi is a controller setting. **On-device calibration** for pH, TDS and light (`get_calibration`, `cal_capture`, `set_calibration`, `reset_calibration`; ConfigBlob schema 2 with schema-1 migration; see "On-device calibration"). No server/MQTT yet) |
+| WP9 | Power ISR, rail epoch, lease handover | `domain/power_mode.*`, `services/power_coordinator.*`, `services/rail_state.*`, `services/acquisition.*` | 6 | — (power sense on GPIO8 measured 25 Oct 2026. **Written 28 Oct 2026, host-tested (8 state-machine tests), builds, NOT run on hardware yet:** see "Low-power mode (WP9)". Kill switch `POLICY_POWER_TRANSITIONS_ENABLED`) |
 | WP10 | Logger queue, supervisor, watchdogs | `diagnostics/*`, `services/supervisor.*` | 4 | — (**written and run on S3 hardware 25 Oct 2026; stall tests PASS** (see "Production run"): logger queue + SerialLogger task (drop and count); cross-core progress stamps; Supervisor checks progress deadlines (Safety 1 s, AcqNormal 2 s, logger 2 s when busy), loss/lateness counters, stack high-water marks and internal heap; AcqNormal and Safety subscribed to the 5 s task watchdog, each resetting it only for itself; `stall_acq` / `stall_safety` envs for the §19 stall test) |
 
 WP2, WP3, WP6 and WP10 can start in parallel. A driver counts as done when it meets the "Completion evidence" column of the §16 table. Compiling is not enough.
@@ -263,6 +271,291 @@ which reads as darkness and switches the lamp ON; firmware cannot detect it.
 Alarm rules are all disabled (no commissioned thresholds). Readings are not
 gated on the 5 V rail until WP9.
 
+## BLE Spike A (WP8 Stage 8.0, historical)
+
+> The `test_ble_spike` env and `test/bringup/ble_spike_main.c` were removed in Stage 8.3: their task became `src/transports/ble_transport.c` and runs in every production image (see "BLE transport"). The commands and results below are kept as the spike's record.
+
+```bash
+pio run -e test_ble_spike -t upload -t monitor
+```
+
+This is the production image (Safety, acquisition and Supervisor, **the relay switches as in Stage 4**)
+plus one extra task, `BleSpike`, on the BleTransport slot (core 0, priority 2). The task serves the
+contract-v2 GATT map through `src/transports/ble_gatt.cpp`. That file is the one C++ file in the
+project, because NimBLE-Arduino is a C++ library; it exports a C API (`ble_gatt.h`) and is compiled only
+with `-D FW_ENABLE_BLE`. Production `esp32dev` does not link NimBLE yet.
+
+What the spike does:
+
+- **Advertising and pairing.** Advertises `Hydro-ESP1` with the service UUID. Pairing uses LE Secure
+  Connections, bonding and MITM, with the ESP as display-only. Boot prints
+  `ble: PAIRING PASSKEY nnnnnn`, a new value on every boot.
+- **Access.** Every characteristic needs an authenticated link (`*_AUTHEN`). The first bonded computer is
+  the owner; a second computer that pairs gets its bond deleted and is disconnected.
+- **Traffic.** State goes out every 2 s and is also the readable value. Telemetry (all 10 metrics from
+  the live snapshot) goes out every 3 s. Both are sent as notifications in MTU-sized chunks.
+- **Commands.** `get_sensors` is answered. Other valid operations get `unknown_op`, because
+  Configuration/NVS is Stage 8.2. Malformed frames get the parser's error.
+- **Bond recovery.** Holding BOOT (GPIO0) for 10 s **while running** clears all bonds. Holding it
+  through reset enters download mode instead.
+- **Diagnostics.** Every 10 s it logs `ble:` lines: secure link, bonds, connects and disconnects,
+  pairing accepted and rejected, frames sent and dropped, longest frame send, notify failures,
+  internal heap (free, min, largest block) and stack headroom of `BleSpike` and `nimble_host`.
+
+At boot it also logs the NimBLE host task's core and priority. NimBLE-Arduino pins the host to core 0;
+compare its priority with Safety's (6), which is the D14 question.
+
+**Test with the desktop app on Windows:**
+
+1. Flash, open the monitor and note the passkey.
+2. Run `python Main.py` (no `--demo`). Open Connection, choose Scan, and check that `Hydro-ESP1` is listed.
+3. Type the passkey and choose Connect. The monitor should show
+   `ble: owner paired and secure (chunk N bytes)`.
+4. The Dashboard fills with live readings. Metrics starts recording.
+5. The app reports "Connected, but the controller did not answer: unknown_op", because
+   `get_lan_token` is not in the spike. This is expected.
+6. Disconnect, then connect again **without** a passkey: the Windows bond is reused.
+7. Wrong passkey: pairing fails, the app asks again, and `pair rej` increases.
+8. Second computer: pairing is rejected. Hold BOOT 10 s, then pair again.
+
+Record from the `ble:` lines while the app is connected:
+- heap (free, min, largest), compared with the radios-off baseline of 342 / 337 / 303 KB;
+- `maxSend`;
+- `notifyFail` and `dropped`.
+
+Also record the Supervisor `jitter` and `late` counts under BLE load.
+
+**First hardware run (25 Oct 2026):** paired from the Windows app with the in-app passkey. Measured over about 8 min connected:
+
+| Check | Result |
+| --- | --- |
+| Pairing | `owner paired and secure`, chunk 244 B (MTU 247), bonds 1, accepted 1, rejected 0 |
+| Commands | `get_sensors` -> ok, `get_lan_token` -> `unknown_op` (expected) |
+| Traffic | ~8.3 frames / 10 s (State 2 s + Telemetry 3 s), dropped 0, notify failures 0, longest frame send 2 ms |
+| Acquisition under BLE load | frames on time, late 0, skip 0, jitter 0 ms, health OK |
+| Internal heap | free 238.4 KB, min 236.6 KB, largest block 221.2 KB, against 342 / 337 / 303 KB with radios off: NimBLE costs ~104 KB heap |
+| Stack free | BleSpike 3732 / 6144 B, nimble_host 1380 / 4096 B (watch), Safety 1316 B after the first relay switch |
+| NimBLE host task | core 0, **priority 21**. Safety (6) was also on core 0 at the time; it has been on core 1 since 28 Oct 2026 (see the D14 Wi-Fi results) |
+
+The same run showed two problems:
+- **Advertising overflow.** The log printed `NimBLEAdvertisementData: Cannot add UUID, data length exceeded!`: the name filled the main advertising packet and the service UUID fell back to the scan response. Fixed: the name now goes in the scan response, the UUID in the main packet.
+- **Repeated boots when the monitor opened (not reproduced since, see below).** The first boot after flashing printed several partial boots, each `reset reason: POWERON`. They stopped at different points, some before the BLE start, so the cause is open. It could be the monitor's DTR/RTS toggling on this USB-UART, or the supply sagging (sensors, relay and radio all on USB). To tell them apart: open the monitor on `esp32dev` (no BLE) and see whether the repeats also happen there; if they appear only with BLE, measure 3.3 V during radio start.
+
+**Follow-up checks (27 Oct 2026, fixed spike, driven by the app's own `BleLink`/`WinPairing` code):**
+
+| Check | Result |
+| --- | --- |
+| Advertising | no more `Cannot add UUID` errors in any boot |
+| Reconnect without passkey | connected in 2.2 s on the Windows bond; `get_sensors` ok; 6 State + 3 Telemetry frames in 10 s |
+| Wrong passkey (after removing the Windows bond) | refused in 1.9 s (`Pairing failed`); ESP `rej` +1, no data served |
+| Right passkey afterwards | paired in 3.6 s, ESP `pair ok` 2, bonds 1; data flowing |
+| Repeated boots | not reproduced in 6 boots (production and spike, controlled reset and monitor-style port opening) |
+
+Two observations for Stage 8.3:
+- **MTU timing.** At `owner paired` the MTU exchange may not have happened yet (`chunk 20 bytes`); it reaches 244 shortly after. So the first frames go out in 20-byte chunks. Harmless, but slower.
+- **Re-pairing deletes the old bond first.** When the bonded computer pairs again, NimBLE's default repeat-pairing handling deletes the old bond before the new pairing is authenticated. So a wrong passkey from the owner's address leaves no bond (`bonds=0` until the right passkey is used). Someone spoofing the owner's address could therefore force a re-pair, but could not take over without the passkey. Decide in 8.3 whether to override `BLE_GAP_EVENT_REPEAT_PAIRING`.
+
+Not tested yet: second computer (owner lock) and BOOT 10 s bond clear (needs a hand on the button).
+
+Build record (25 Oct 2026):
+
+| Image | RAM (static) | Flash |
+| --- | --- | --- |
+| `esp32dev` | 45 488 B | 304 845 B |
+| `test_ble_spike` | 72 996 B | 557 173 B |
+
+So NimBLE adds about 27.5 KB of static RAM and 252 KB of flash.
+
+## Wi-Fi station and LAN link (WP8 Stage 8.4)
+
+> **28 Oct 2026: the LAN link below was removed.** The app connects over
+> Bluetooth only; the station, its status in State, `set_wifi` / `forget_wifi`
+> and the WP9 stop/start hooks stay. `wifi_lan.cpp` no longer uses ESPmDNS;
+> a stop request now puts the radio in `WIFI_OFF` and `wifiMqttRadioOff()` is
+> the acknowledgement PowerCoordinator waits for. A left-over `lan_tok` NVS key
+> is erased once at boot. The text below is the 8.4 record.
+
+The task is "WifiMqtt" (core 0, priority 2, 6 KB stack) in `src/transports/wifi_mqtt.c`, over the C shim `wifi_lan.cpp` (Arduino `WiFi` + `ESPmDNS`). It is in every production image (`FW_ENABLE_WIFI`, set together with `FW_ENABLE_BLE` in `[production]`). It never waits for an access point, and a Wi-Fi failure never touches sensing or Safety. There is no MQTT and no server yet; the task name is kept from the architecture's task table.
+
+**Station.**
+- Credentials come from Configuration (`set_wifi` from the app's Wi-Fi page, over Bluetooth). A change or `forget_wifi` restarts the station at once.
+- Each join attempt has 15 s. A failed attempt reports `failed` and retries with exponential backoff: 1, 2, 4 … 60 s, ±20 % jitter (`domain/backoff`). A lost connection retries from 1 s.
+- `WiFi.persistent(false)` keeps the credentials out of the Wi-Fi driver's NVS storage; Configuration is their only store.
+- Modem sleep stays on, because Bluetooth shares the radio.
+- `wifiMqttRequestStop/Start` are the WP9 power-transition hooks.
+
+**mDNS.** While connected, the board announces `_hydro._tcp` on port 47800 with TXT `node=Hydro-ESP1` and `v=2`; the host name is `hydro-esp1`.
+
+**LAN link (read-only).**
+- TCP port 47800, at most 2 clients.
+- A client must send `hello` with the 32-hex LAN token within 5 s. The token is compared in constant time; if none has been issued yet, nobody gets in. A wrong or missing token gets `unauthorized` and the socket is closed.
+- After the hello, the client receives the same frames as Bluetooth (`transports/frames.c`, same boot id, `"link":"lan"`): State every 2 s, Telemetry every 3 s, alarm events.
+- Any command gets `ble_only`.
+- Telemetry is skipped when the socket is not writable. A client that cannot take a whole frame is dropped, so the stream is never corrupted.
+- Rotating the token (over Bluetooth), losing Wi-Fi or a stop request closes every client.
+
+**State.** `wifi.state` is `unconfigured`, `connecting`, `connected` or `failed`. When connected, the frame also carries the IP and RSSI. The app stores the IP and uses it if mDNS is blocked.
+
+**Supervision.** A 2 s progress deadline, stack check and task watchdog. Every 60 s a `wifi:` line logs state, IP, RSSI, joins, failures, backoff, LAN clients, refusals, drops and skipped telemetry.
+
+**Known limits:**
+- The LAN link is plaintext. It carries read-only data, and the token only keeps casual clients out (contract v2).
+- The PHY calibration data stored by the Wi-Fi driver in NVS (namespace `phy`, written by the IDF at first start) is a second framework writer besides the NimBLE bond store. Like the bond store, those writes do not take the flash gate.
+
+**Bench tool.** `tools/lan_bench.py APP_DIR checks|stream N` runs over the app's own `BleLink` and `LanLink`. The PC must be bonded, the ESP must be on Wi-Fi, and the app must not be connected over Bluetooth at the same time.
+- `checks` covers: wrong token, right token, a command over LAN, rotating the token, old and new token.
+- `stream N` keeps Bluetooth and LAN busy together for N seconds (radio-load test).
+
+**Hardware run (27–28 Oct 2026):**
+
+| Check | Result |
+| --- | --- |
+| Failure path (`tools/wifi_fail_bench.py`, non-existent network) | each attempt 15 s, then `failed`; retries after 0.96, 2.04, 4.10, 6.58 s (1/2/4/8 s ±20 %); `forget_wifi` -> `unconfigured` at once |
+| Real join (credentials from the app's Wi-Fi page) | joined in 12.5 s (172.16.1.27, RSSI −58 dBm); 2.6–3.6 s from boot on later boots |
+| App with link preference Auto | switched to the LAN link by itself 2 s after the join |
+| `lan_bench.py checks` | wrong token -> `unauthorized` + closed; right token -> data; command over LAN -> `ble_only`; same boot id on both links; rotate -> LAN client dropped, old token refused, new one accepted |
+| BLE + LAN streaming 100 s | BLE 55 State + 36 Telemetry, LAN 50 + 33, no drops |
+
+**D14 Safety under Wi-Fi + BLE load (`alarm_latency`).** Per 20 trips:
+
+| Phase | submit -> action | sample -> action |
+| --- | --- | --- |
+| **Boot, Wi-Fi radio starting** | **38.8–109.8 ms (one trip per boot)** | **40–110 ms ✗** |
+| Wi-Fi connected, idle | max 502 us | max 1 ms |
+| + BLE streaming | max 113 us | 0 ms |
+| + BLE and LAN streaming | max 544 us | max 1 ms |
+
+**FAIL at Wi-Fi start-up.** Three instrumented boots (a `latency SPIKE` line now prints any trip over 5 ms in the test build) show one slow trip of 40–110 ms per boot, always within ~50 ms of `wifi: joining`, and none afterwards. The Wi-Fi driver's start-up (RF calibration at high priority on core 0) starves Safety on core 0.
+
+**The D14 fallback fixes it.** With Safety on core 1 (first tried with a test-only override), the same three boots stay at max 145 us submit -> action and ≤ 1 ms sample -> action, with acquisition still 0 late frames and ≤ 1 ms jitter.
+
+**Decision (28 Oct 2026, project owner): Safety moved to core 1 in the frozen task table** (`include/app_config.h`: `{"Safety", 1, 6, 3 * 1024}`). The team lead should be told, because it changes a frozen contract. Core 0 now holds the radios (Wi-Fi driver, NimBLE host, TCP/IP), BleTransport, WifiMqtt, Configuration and Supervisor. Core 1 holds Safety (priority 6), AcqNormal (4) and SerialLogger (1). Re-test results are below.
+
+**Re-test with Safety on core 1 from the task table (28 Oct 2026, `alarm_latency`, 3 boots):**
+- **Safety:** `safety: started (core 1, prio 6)`, and no `latency SPIKE` in any boot.
+- **First report window (radio start at 0.77 s):** worst submit -> action 97 / 167 / 96 us; sample -> action ≤ 1 ms.
+- **Acquisition:** 0 late frames, jitter ≤ 1 ms.
+- **Production `esp32dev` (90 s):** health OK; stack free saf 2232, acq 2376, cfg 2212, ble 3660, wifi 4300 B; internal heap with both radios on 153.5 KB free (min 153.2 KB, largest block 139 KB).
+- **Wi-Fi did not join in these runs**, retrying with backoff: 15 s timeouts, then about 1, 2, 4.6 and 7.7 s waits. The radio still started at 0.77 s, so the start-up case D14 is about was covered. The steady state with Wi-Fi connected was measured before the move (max 544 us); repeat it on core 1 once the network is reachable again.
+
+**Connected-state run on core 1 (28 Oct 2026, network `mohsen`, `alarm_latency`, 180 s):**
+- **Setup:** Wi-Fi connected 2.9 s after boot (RSSI −32 dBm). The desktop app reconnected over Bluetooth by itself at 10.8 s and streamed until the end.
+- **Result:** 35 reports of 20 trips each. Worst submit -> action 152 us, sample -> action ≤ 1 ms, no `latency SPIKE`. Acquisition: 0 late frames, jitter ≤ 1 ms.
+- **D14 passes on core 1 with Wi-Fi and BLE both up.**
+- **LAN port check:** reachable from the PC on the same network; a wrong token gets `unauthorized`.
+- **Not covered:** in this run the app did not open its LAN link, so LAN streaming load was not part of it. LAN streaming was part of the earlier core-0 run (max 544 us).
+
+## BLE transport (WP8 Stage 8.3)
+
+Every production image (`esp32dev`, `stall_*`, `alarm_latency`) defines `FW_ENABLE_BLE` and starts the BLE transport after acquisition. Bring-up envs do not define it and never link NimBLE. If the BLE transport fails to start, sensing and Safety keep running; only the app link is lost.
+
+The task is "BleTransport" (core 0, priority 2, 6 KB stack), in `src/transports/ble_transport.c` over the C shim `ble_gatt.cpp`.
+
+**Pairing.**
+- LE Secure Connections with bonding and MITM, ESP display-only, one bonded owner.
+- The passkey is drawn inside `bleGattStart()` after NimBLE has started the radio (true RNG), before advertising. It is printed once: `ble: PAIRING PASSKEY nnnnnn`.
+- Holding BOOT for 10 s while running clears all bonds.
+
+**Traffic and priority.**
+- Order of service: commands and their results, then alarm events (from the Safety journal, from link-up on), then State (every 2 s and at link-up; also the readable value), then Telemetry (every 3 s).
+- A telemetry frame that cannot be queued is dropped and superseded by the next one (`tlmDrop`).
+- Results retry for up to 200 ms per chunk (`resDrop` if that fails).
+
+**Commands.**
+- `get_sensors` is answered here.
+- `set_sensor_enabled`, `set_wifi`, `forget_wifi`, `get_lan_token` and `rotate_lan_token` go to Configuration; `reset_latch` goes to Safety.
+- Up to 8 commands are in flight; more get `busy`.
+- Each request carries the link's session generation and a 5 s expiry, so a reply is never sent on a newer link and a command is never applied late. Reply tags carry a sequence number, so a late reply cannot reach a reused slot.
+
+**Supervision.** A 2 s progress deadline, stack check and task watchdog (the task resets it only for itself). Every 60 s a `ble:` line logs pairing counters, frames, `tlmDrop`, `resDrop`, `busy`, `maxSend` and `notifyFail`.
+
+**Known limits (decided in 8.3):**
+- **Re-pairing deletes the old bond first.** If the bonded computer pairs again, NimBLE-Arduino's default handling deletes its old bond before the new pairing is authenticated. A wrong passkey from that address therefore leaves no bond. Taking over still needs the passkey, so this is a denial-of-service, not a takeover. Changing it would mean patching the pinned library, so it is documented instead.
+- **NimBLE writes its own bond store to NVS** (during pairing only). This is the one documented exception to "Configuration is the only NVS writer", and those writes do not take the flash gate.
+- **NimBLE host priority.** The host runs on core 0 at priority 21. Safety has been on core 1 since 28 Oct 2026 (D14 with Wi-Fi), so the radios no longer share its core.
+- **Wi-Fi state.** Since 8.4, State reports the real station state (see "Wi-Fi station and LAN link").
+
+**Hardware run (27 Oct 2026, `esp32dev`, bench `tools/ble_bench.py` over the app's own `BleLink`):**
+
+| Check | Result |
+| --- | --- |
+| Boot | `ble: started (core 0, prio 2), NimBLE host core 0 prio 21`; passkey printed once; no WARN/ERROR |
+| Config across a reflash | the revision stored by the 8.2 bench (rev 3) loaded unchanged |
+| Bench `before` | TDS off -> `cfg_rev 4`, null/STALE; token stable, rotate changes it; `set_wifi` stored; bad rule -> `bad_field`; State reports `fw 0.8.3`, `sgp30_baseline learning` |
+| Reboot, bench `after` | rev 4, TDS off, SSID and token all kept; restore -> rev 5, TDS back |
+| Health (60 s report) | stack free ble 3508 / 6144 B, cfg 2028 / 4096 B; heap 228.6 KB (min 226.8 KB); frames late 0 / skip 0 |
+| Congestion | burst of replies: `notifyFail 8`, `maxSend 36 ms`, `tlmDrop 1` (superseded telemetry), `resDrop 0` |
+
+**D14 Safety under BLE load (`alarm_latency`, 27 Oct 2026).** A test rule trips on every BME280 sample (4/s). Results per 20 trips:
+
+| Phase | Reports | submit -> action (us) | sample -> action (ms) |
+| --- | --- | --- | --- |
+| BLE advertising, no client (0-48 s) | 9 | avg 72-77, max 123 | max 1 |
+| Owner connected, State + Telemetry streaming + a command every 2 s (48-145 s) | 20 | avg 71-84, max 137 | max 1 |
+
+**PASS:** worst case 1 ms against the 10 ms target, so the D14 fallback (Safety on core 1) is not needed for BLE. Repeat this with Wi-Fi up in 8.4: the TCP/IP task (priority 18) is also on core 0.
+
+**Bench tools** (in `tools/`, use PlatformIO's Python for `serial_log.py` and the app's venv for `ble_bench.py`):
+- `serial_log.py PORT FILE SECONDS [--reset]`: logs the port without the monitor's DTR/RTS toggling. `--reset` gives exactly one controlled boot.
+- `ble_bench.py APP_DIR before|after|stream N`: runs the configuration bench before and after a reboot, or keeps a busy link for N seconds.
+
+## Configuration and NVS (WP8 Stage 8.2)
+
+`services/configuration.c` is the only NVS writer. Its task is "Configuration": core 0, priority 2, 4 KB stack. It is fed by an 8-entry request queue; a full queue answers `busy`, never false success.
+
+NVS namespace `hydro`:
+
+| Key | Content | Written |
+| --- | --- | --- |
+| `cfg_a` / `cfg_b` | `ConfigBlob` schema 2 (magic, schema, revision, sensor mask, `calOverridden`, lamp policy, pH / TDS / light calibration, CRC-32) | on a change, into the slot not holding the current config; boot loads the newest valid slot. A schema-1 slot (up to 8.4) is migrated: revision and sensor mask kept, calibrations from the defaults |
+| `wifi` | SSID and password | `set_wifi` / `forget_wifi`; never logged or sent back |
+| `lan_tok` | (removed 28 Oct 2026) | erased once at boot if an 8.4 image left it |
+| `sgp_base` | SGP30 baseline | offered by acquisition hourly once valid; written only if it changed, at most once an hour |
+| `rst_hist` | last 8 `esp_reset_reason()` codes | once per boot, 30 s after start (never during a reset loop) |
+
+**Only the sensor mask is set by a command so far.** The lamp policy and the pH/TDS calibration still come from `include/policy_config.h`: the blob copies them, but `configBlobRefreshDefaults()` overwrites them from the source on every boot. A re-measured value in the source therefore always wins over an old copy in flash, and the revision goes up when it changes. RTOS §14.1's NVS-backed thresholds wait for a set-calibration command, which will add an "overridden" flag.
+
+**Boot.** `configurationInit()` runs before Safety and acquisition. It loads the config, publishes it, and returns. If NVS fails, the compiled defaults apply: all sensors on, nothing stored.
+
+**Applying a change.** A change is applied by AcqNormal itself at the next frame boundary (no other task touches a driver):
+- a disabled sensor is cancelled and no longer scheduled; its readings age to STALE and the protocol sends `null`;
+- a re-enabled sensor is initialised again.
+
+Configuration replies `ok` only after acquisition acknowledges the new revision (≤ 3 s), otherwise `timeout`. The revision is stamped into every Reading (`configRevision`).
+
+**Safety rules for sensor changes.** Switching a sensor off is refused (`rule_latched`) while one of its alarm rules is latched or active (`safetyRulesBlockSensor`, §12). A disabled sensor's *unlatched* rules raise no stale alarm. A latched rule stays visible until its sensor is back and a valid recovery sample arrives.
+
+**Flash gate.** `services/flash_gate.c` keeps NVS writes out of the HC-SR04 echo window: a flash write stalls the cache on both cores, which would delay the echo interrupt.
+- Acquisition only *tries* the gate (zero wait) and defers the ping.
+- Configuration waits up to 100 ms per try.
+- Bring-up builds never create the gate, so it counts as free there.
+
+**Safety commands.** `safetySubmitCommand()` (4-entry queue) carries `reset_latch` with an expiry, so a latch reset is never applied late. Safety also keeps the 64-event alarm journal (`safetyJournalNext()`, independent cursors for BLE and LAN).
+
+**Supervisor.** It now also watches Configuration: a 3 s progress deadline, its stack, and the 5 s task watchdog, which Configuration resets itself, including while it waits.
+
+**Bench.** At the time of the 8.2 bench, `test_ble_spike` routed the app's commands to Configuration and Safety, so the Sensors and Wi-Fi pages work end to end. There is still no Wi-Fi station (8.4): stored credentials show as `connecting`.
+
+**Bench run (27 Oct 2026, `test_ble_spike`, driven over BLE by the app's own `BleLink`):**
+
+| Check | Result |
+| --- | --- |
+| First boot on erased config | `cfg: rev 1, sensors 0x7f` (defaults stored) |
+| `set_sensor_enabled tds false` | `ok`, `cfg_rev 2`; `acq: sen0244_tds disabled` 1.0 s later (next frame); TDS telemetry `null` / STALE; State `enabled` without `tds`; telemetry `cfg_rev 2` |
+| Same request again | `ok`, revision unchanged (no flash write) |
+| `get_lan_token` twice, then `rotate_lan_token` | same token twice; rotate gives a new one |
+| `set_wifi` | `stored`; State shows the SSID, `connecting` (no station until 8.4) |
+| `reset_latch` with rule 5 | `bad_field` |
+| **Reboot** | `cfg: rev 2, sensors 0x5f, wifi set, LAN token set`; TDS still off from boot; same token; same SSID |
+| Re-enable TDS, `forget_wifi` | `cfg_rev 3`, TDS re-initialised and back to values; Wi-Fi `unconfigured` |
+| Reset history | written once, 30 s after boot: `1 0 …`, then `1 1 …` (1 = POWERON) |
+| Health during the run | no WARN/ERROR lines, frames late 0 / skip 0 / jitter 0 ms, stack free cfg 2208 / 4096 B, heap free 228.7 KB (min 227.0 KB) |
+| Distance during flash writes | ~3.47 m throughout; the one 566 mm value came at t = 10 s, before any write. The 5 s summary is too coarse to prove "no glitch", so a ping-by-ping log during writes is still to do |
+
+Notes:
+- **Notify retries.** A burst of six command replies caused 6 notify retries (`notifyFail=6`, `maxSend 27 ms`) with **0 frames dropped**. The 8.3 transport should keep the retry loop.
+- **Not covered on hardware.** The refusal to disable a sensor while its rule is latched: all rules ship disabled, so it is covered only by the host tests (`test_safety_disabled_sensor_cannot_silence_alarm`).
+
 ## pH-4502C calibration (WP5)
 
 Wiring: PO -> 10 kOhm -> GPIO7 (ADC1_CH6), 15 kOhm and 1 uF to GND. DO and TO
@@ -303,8 +596,91 @@ reports these readings as `HEALTH_UNCALIBRATED` (`calibrationProvisional`), so
 they never count as actionable. Bring-up tests on 17 Oct gave tap water 6.9,
 vinegar 3.6 and baking soda 7.8.
 
-Production code does not store the calibration yet. Keeping the fit in NVS is
-WP8 (`services/configuration`).
+Production keeps the compiled nominal fit until the user calibrates on the
+device (next section); after that the stored fit is used and pH reads `OK`.
+
+## On-device calibration (WP8, 28 Oct 2026; written, not flashed)
+
+The app's **Calibration** page calibrates, on demand, the three sensors whose
+reading depends on the individual probe. The fit is stored in the ConfigBlob
+(NVS), survives reboots and firmware updates, and is applied by acquisition at
+the next frame boundary (`applyConfiguration()` -> `phDriverSetCalibration` /
+`tdsDriverSetCalibration` / `lightDriverSetCalibration`).
+
+| Sensor | Points | x (raw, from `cal_capture`) | Fit, plausibility (`policy_config.h`) | After |
+| --- | --- | --- | --- | --- |
+| pH | 2 buffers >= 1 pH apart | module mV (pin mV through the 10k/15k divider) | two-point line, \|slope\| 0.002-0.02 pH/mV | pH `OK` (no longer provisional) |
+| TDS | 1 reference solution | ppm at 25 degC on the nominal curve, before K | K = ref / x, 0.5-2.0 | TDS `OK` |
+| Light | 1 lux-meter reading | pin mV | lux per mV through zero, 0.01-100 | light in `lux` (`UNIT_LUX`), `OK` |
+
+- **Ownership.** `cal_capture` never touches a driver or the ADC: BleTransport
+  peeks the snapshot and converts the `raw` (filtered pin mV) the drivers
+  already publish (`domain/cal_capture`, host-tested). It refuses with `stale`
+  when the sensor is off, unpowered, faulty, older than 5 s, or (TDS) without
+  a fresh water temperature.
+- **Defaults.** `configBlobRefreshDefaults()` still copies the compiled values
+  at boot, except for a calibration whose `CAL_BIT_*` is set in
+  `calOverridden`. `reset_calibration` restores the compiled default and clears
+  the bit.
+- **Safety.** Refused (`rule_latched` / `rule_active`) while an alarm rule on
+  that sensor is latched / active, like switching it off.
+- **Lamp.** The lamp thresholds stay in light-sensor pin mV: `lamp_control`
+  uses `Reading.raw` once the value is lux, so calibrating never moves the lamp.
+- **Not calibrated here:** BME280 and DS18B20 (factory-calibrated), SGP30 (own
+  baseline in `sgp_base`), HC-SR04 (distance; a tank-height mapping and a
+  DS18B20 offset are possible follow-ups).
+- **Not hardware-tested yet.** On the bench: calibrate pH in 7.00 / 4.00
+  buffers, reboot, check `cfg: ... calibrated 0x01` and pH `OK`.
+
+## Low-power mode (WP9, 28 Oct 2026; written, not flashed)
+
+Before this date `power_coordinator.c` was a stub: State always reported
+`"mode":"unknown"`. Only the GPIO8 sense itself had been measured
+(`test_power_sense`).
+
+- **Decisions:** `domain/power_mode.c`, a pure state machine with 8 host tests
+  (`test/native/test_power`): boot paths, 50 ms loss debounce
+  (`CFG_POWER_LOSS_DEBOUNCE_MS`; the 20 ms `BOARD_POWER_SENSE_QUALIFY_MS` was
+  the bench qualification only), 500 ms stable return, quiesce -> RELEASED ->
+  grant order, DEGRADED on a missing acknowledgement (200 ms worker, 2 s Wi-Fi)
+  without ever granting a second owner, and abort of a return on a new loss.
+- **Task "PowerCoord"** (core 0, priority 5, 4 KiB) feeds it every 10 ms while
+  anything is pending (100 ms otherwise). The GPIO8 edge ISR runs on core 1,
+  where AcqNormal installed the GPIO ISR service: it invalidates the rail
+  (new epoch), disables itself (a loss chatters 479-928 edges) and notifies
+  the task, which re-arms it after 50 ms of quiet level.
+- **Loss:** AcqNormal quiesces (pending steps cancelled; 5 V drivers
+  `preparePowerOff`, HC-SR04 TRIG held low) and releases; AcqLowPower (core 0)
+  gets the lease with BME280, DS18B20, light and SGP30; Wi-Fi goes to
+  `WIFI_OFF`; Safety drives the relay OFF (`lamp_reason` "no 5 V": the coil
+  has no supply). pH, TDS and HC-SR04 publish `UNPOWERED`. BLE stays up.
+- **Return:** 500 ms of stable power, then the low-power worker releases, the
+  rail is restored, AcqNormal gets every sensor back (they re-init and show
+  `WARMING`), Wi-Fi rejoins.
+- **Rail gating:** a 5 V sensor starts only while the rail is valid, and its
+  result is kept only if the rail is still valid with the same epoch at the end.
+  State's `power_epoch` is now the live rail epoch.
+- **Deviation from §15:** Safety stays on core 1 (D14 move, 28 Oct 2026), so
+  core 1 is not idle in low power. CPU frequency and light sleep are unchanged.
+- **Kill switch:** `POLICY_POWER_TRANSITIONS_ENABLED 0` in `policy_config.h`:
+  no ISR, every sensor on the normal worker, the mode only reports the level.
+- **Bench checks to run once the circuit exists:** unplug the 5 V feed with the
+  app connected: NORMAL -> TRANSITION_TO_LOW -> LOW_POWER within ~0.3 s, Wi-Fi
+  off, pH / TDS / level `UNPOWERED`, relay off, BLE still up; replug: back to
+  NORMAL after ~0.5 s, sensors WARMING then OK, Wi-Fi rejoins. Also: count ISR
+  wake-ups per unplug (should be one per storm), and repeat D14 with Wi-Fi
+  connected.
+  - Every transition switches the Wi-Fi driver off (`WIFI_OFF`) and back on:
+    the same radio start that starved core 0 in D14. Measure the core-0 stall
+    during a transition and watch the heap over many unplug cycles.
+  - In low power the DS18B20 1-Wire timing (interrupts masked) runs on core 0
+    next to the BT controller: check that BLE stays stable, since it is now
+    the only link.
+- **Before the first flash:** this ships with transitions ON and GPIO8 has no
+  pull. Without the sense divider wired, the board boots into low power (or
+  flaps if the pin floats). Wire the divider, or set
+  `POLICY_POWER_TRANSITIONS_ENABLED 0`, before flashing. This also applies to
+  `alarm_latency` and the stall test envs.
 
 ## DS18B20 bring-up (WP2)
 

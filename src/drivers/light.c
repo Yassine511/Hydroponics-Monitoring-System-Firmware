@@ -89,9 +89,17 @@ static PollResult finish(LightDriver* self, MonoMs now) {
   r->raw = (int32_t)(pinMv + 0.5f);
   // Clipped = brighter than the ADC can show: a lower bound, not a fault.
   r->qualityFlags = self->saturated_ ? kQualitySaturated : kQualityNone;
-  r->unit = UNIT_MILLIVOLT;
-  r->value = pinMv;  // no divider: pin mV = module mV
-  r->health = HEALTH_UNCALIBRATED;  // no lux mapping until a reference meter (D13)
+  r->calibrationRevision = self->config_.calibration.revision;
+  if (self->config_.calibration.valid) {
+    r->unit = UNIT_LUX;
+    r->value = linearApply(&self->config_.calibration, pinMv);
+    if (r->value < 0.0f) r->value = 0.0f;
+    r->health = HEALTH_OK;
+  } else {
+    r->unit = UNIT_MILLIVOLT;
+    r->value = pinMv;  // no divider: pin mV = module mV
+    r->health = HEALTH_UNCALIBRATED;  // no lux mapping until a reference meter (D13)
+  }
   r->lastGoodMs = now;  // last usable result (OK or UNCALIBRATED)
   ++r->sequence;
   PollResult pr = {DRIVER_READY, now};
@@ -136,4 +144,9 @@ void lightDriverConstruct(LightDriver* self, const LightConfig* config) {
   self->startMs_ = 0;
   self->lastSampleMs_ = 0;
   readingReset(&self->result_, SENSOR_LIGHT, METRIC_LIGHT_LEVEL, UNIT_MILLIVOLT);
+  self->result_.calibrationRevision = config->calibration.revision;
+}
+
+void lightDriverSetCalibration(LightDriver* self, const LinearCalibration* calibration) {
+  self->config_.calibration = *calibration;
 }

@@ -24,6 +24,15 @@
 #define SUPERVISOR_SAFETY_DEADLINE_MS 1000u
 #define SUPERVISOR_ACQ_DEADLINE_MS 2000u
 #define SUPERVISOR_LOGGER_DEADLINE_MS 2000u
+// Configuration wakes every 500 ms and marks progress while it waits for a
+// flash-gate slot or for acquisition to apply a change (<= 3 s).
+#define SUPERVISOR_CONFIG_DEADLINE_MS 3000u
+// BleTransport wakes every 50 ms; one frame send retries for at most ~200 ms per chunk.
+#define SUPERVISOR_BLE_DEADLINE_MS 2000u
+// WifiMqtt wakes every 50 ms; every socket call is non-blocking.
+#define SUPERVISOR_WIFI_DEADLINE_MS 2000u
+// PowerCoord wakes at least every 100 ms (WP9).
+#define SUPERVISOR_POWER_DEADLINE_MS 1000u
 #define SUPERVISOR_BOOT_GRACE_MS 5000u
 
 #define SUPERVISOR_STACK_WARN_BYTES 512u  // §16: keep >= 25 % headroom; warn below this

@@ -72,7 +72,10 @@ typedef struct TaskSpec {
 static inline const TaskSpec* cfgTaskSpec(TaskId id) {
   // Indexed by TaskId. Keep order in sync with the enum above.
   static const TaskSpec kTaskSpecs[TASK_ID_COUNT] = {
-      {"Safety", 0, 6, 3 * 1024},
+      // Core 1 since 28 Oct 2026 (D14 fallback): the Wi-Fi driver's start-up
+      // starved Safety on core 0 for 40-110 ms; on core 1 the worst case is
+      // 145 us. Frozen-header change made on the project owner's decision.
+      {"Safety", 1, 6, 3 * 1024},
       {"PowerCoord", 0, 5, 4 * 1024},
       {"AcqNormal", 1, 4, 4 * 1024},
       {"AcqLowPower", 0, 4, 4 * 1024},

@@ -72,3 +72,7 @@ void tdsDriverConstruct(TdsDriver* self, const TdsConfig* config);
 // Compensation input from the latest DS18B20 reading (copied, not shared).
 // Checked for health and age when the window finishes; no ADC access here.
 void tdsDriverSetWaterTemperature(TdsDriver* self, const Reading* waterTemperature);
+
+// New K-factor from the applied configuration (on-device calibration, WP8).
+// Called by the acquisition owner between windows; applies from the next one.
+void tdsDriverSetCalibration(TdsDriver* self, const LinearCalibration* calibration);

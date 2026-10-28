@@ -18,6 +18,8 @@
 //   calibration.valid  -> value in pH, HEALTH_OK (FAULT outside 0-14)
 //     + calibrationProvisional -> value in pH, HEALTH_UNCALIBRATED (a nominal
 //                         fit, e.g. shorted-BNC offset + tutorial slope)
+//                         (also outside 0-14: the nominal fit may not match the
+//                         probe yet; capturable for calibration, never actionable)
 //   otherwise          -> value = module mV, UNIT_MILLIVOLT, HEALTH_UNCALIBRATED
 //   window mean < PH_NO_SIGNAL_PIN_MV -> HEALTH_UNPOWERED (a 0 V output is a
 //                         dead rail or open lead, never "very acidic", §10).
@@ -70,3 +72,7 @@ typedef struct PhDriver {
 
 // Constructor. Use &driver.base wherever a SensorDriver* is expected.
 void phDriverConstruct(PhDriver* self, const PhConfig* config);
+
+// New fit from the applied configuration (on-device calibration, WP8).
+// Called by the acquisition owner between windows; applies from the next one.
+void phDriverSetCalibration(PhDriver* self, const LinearCalibration* calibration, bool provisional);
