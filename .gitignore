@@ -2,3 +2,12 @@
 .vscode/
 __pycache__/
 tools/.ble_bench_state.json
+# Desktop app (app/): environments and build work files. app/dist/ (the
+# Windows .exe and the Linux binary) IS committed.
+app/.venv/
+app/.venv-linux/
+app/build/
+app/.pytest_cache/
+app/*.spec
+app/link.log
+*.pyc

@@ -3,7 +3,7 @@
 The PC must already be bonded with the ESP (pair once from the app), so no
 passkey is needed. Run with the app's virtual environment:
 
-  APP=../Hydroponics-Monitoring-System-master/BluetoothControlApp
+  APP=app
   $APP/.venv/Scripts/python tools/ble_bench.py $APP before
   (reboot the ESP)
   $APP/.venv/Scripts/python tools/ble_bench.py $APP after

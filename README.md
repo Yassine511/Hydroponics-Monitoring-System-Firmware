@@ -5,6 +5,31 @@
 > `esp32-s3-devkitc-1`, and the env names are unchanged. The MQ-7 has been removed
 > from the hardware and replaced by an **SGP30** on the retained 3.3 V supply (D18).
 
+> **Status (28 Oct 2026):** WP1-WP8 done; WP8 8.0-8.4 hardware-tested, then
+> the LAN link removed (Bluetooth is the only app link), on-device calibration
+> added, and WP9 low-power mode written. The calibration and WP9 code is
+> **host-tested and builds but has not been flashed yet** (no circuit). See
+> "Connecting the app", "On-device calibration" and "Low-power mode (WP9)".
+
+## Connecting the app
+
+The desktop app is in [`app/`](app/Readme.md) (Windows `.exe` and Linux
+binary in `app/dist/`, or run from source). It talks contract v2
+([`app/FirmwareContract.md`](app/FirmwareContract.md)) over **Bluetooth LE only**.
+
+1. Flash `esp32dev` and open the serial monitor (115200). Boot prints
+   `ble: PAIRING PASSKEY nnnnnn` once.
+2. In the app: **Connection** -> **Scan for controllers**, type the passkey,
+   **Connect**. Later connections reuse the bond and need no passkey.
+3. Optional: **Wi-Fi** page -> SSID + password (sent over the bonded link,
+   stored only in the ESP's NVS). The app itself never connects over Wi-Fi.
+4. **Calibration** page when a probe needs it (pH, TDS, light).
+
+**One owner, bond recovery.** The ESP accepts one bonded computer. To move to
+another computer (or after "Forget this controller" in the app), hold **BOOT
+(GPIO0) for 10 s while the firmware is running**, not during reset (that enters
+download mode), then pair again with the new passkey.
+
 ## Pin map (Pin Layout, 22 Oct 2026; architecture §5)
 
 | Signal | GPIO | Notes |
@@ -463,7 +488,8 @@ The task is "BleTransport" (core 0, priority 2, 6 KB stack), in `src/transports/
 
 **Commands.**
 - `get_sensors` is answered here.
-- `set_sensor_enabled`, `set_wifi`, `forget_wifi`, `get_lan_token` and `rotate_lan_token` go to Configuration; `reset_latch` goes to Safety.
+- `get_calibration` and `cal_capture` are answered here too (zero-wait peeks of the applied config and the snapshot).
+- `set_sensor_enabled`, `set_wifi`, `forget_wifi`, `set_calibration` and `reset_calibration` go to Configuration; `reset_latch` goes to Safety. (Up to 8.4 also `get_lan_token` / `rotate_lan_token`, removed 28 Oct 2026 with the LAN link.)
 - Up to 8 commands are in flight; more get `busy`.
 - Each request carries the link's session generation and a 5 s expiry, so a reply is never sent on a newer link and a command is never applied late. Reply tags carry a sequence number, so a late reply cannot reach a reused slot.
 
@@ -530,13 +556,14 @@ Configuration replies `ok` only after acquisition acknowledges the new revision 
 - Configuration waits up to 100 ms per try.
 - Bring-up builds never create the gate, so it counts as free there.
 
-**Safety commands.** `safetySubmitCommand()` (4-entry queue) carries `reset_latch` with an expiry, so a latch reset is never applied late. Safety also keeps the 64-event alarm journal (`safetyJournalNext()`, independent cursors for BLE and LAN).
+**Safety commands.** `safetySubmitCommand()` (4-entry queue) carries `reset_latch` with an expiry, so a latch reset is never applied late. Safety also keeps the 64-event alarm journal (`safetyJournalNext()`, one independent cursor per link; only BLE since the LAN link was removed).
 
 **Supervisor.** It now also watches Configuration: a 3 s progress deadline, its stack, and the 5 s task watchdog, which Configuration resets itself, including while it waits.
 
 **Bench.** At the time of the 8.2 bench, `test_ble_spike` routed the app's commands to Configuration and Safety, so the Sensors and Wi-Fi pages work end to end. There is still no Wi-Fi station (8.4): stored credentials show as `connecting`.
 
-**Bench run (27 Oct 2026, `test_ble_spike`, driven over BLE by the app's own `BleLink`):**
+**Bench run (27 Oct 2026, `test_ble_spike`, driven over BLE by the app's own `BleLink`):** (record of that
+firmware: the LAN token rows no longer apply since 28 Oct 2026, and the ConfigBlob is now schema 2)
 
 | Check | Result |
 | --- | --- |

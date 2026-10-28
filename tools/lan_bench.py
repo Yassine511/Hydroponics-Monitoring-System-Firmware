@@ -4,7 +4,7 @@ The PC must be bonded with the ESP and the ESP must already be on Wi-Fi
 (credentials sent from the app's Wi-Fi page). The app itself must not be
 connected over Bluetooth while this runs (one BLE client at a time).
 
-  APP=../Hydroponics-Monitoring-System-master/BluetoothControlApp
+  APP=app
   $APP/.venv/Scripts/python tools/lan_bench.py $APP checks      # token, refusal, read-only, rotate
   $APP/.venv/Scripts/python tools/lan_bench.py $APP stream 90   # keep LAN (and BLE) busy N seconds
 
