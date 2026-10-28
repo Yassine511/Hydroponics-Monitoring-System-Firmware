@@ -104,6 +104,9 @@ static JournalCursor s_journalCursor;
 static bool s_eventPending;    // an event failed to send and waits at the cursor
 static bool s_eventLost;       // ... and its link closed: the next event reports gap:true
 static uint32_t s_tornGeneration = UINT32_MAX;  // link whose stream was cut mid-frame
+#ifdef FW_INJECT_BLE_TEAR
+static uint32_t s_tearCount;  // env:ble_tear: telemetry frames sent
+#endif
 
 // NimBLE host task: copy and return (ble_gatt.h threading rule).
 static void onRx(const uint8_t* data, size_t len, uint32_t generation, void* ctx) {
@@ -155,12 +158,16 @@ static bool sendFrame(BleChannel channel, size_t payloadLen, uint32_t generation
   if (generation == s_tornGeneration) return false;  // being dropped
   const MonoMs start = monoNowMs();
   const size_t total = FRAME_HEADER_BYTES + payloadLen;
+  bool tear = false;  // env:ble_tear: buffers "stay full" after the first chunk
+#ifdef FW_INJECT_BLE_TEAR
+  if (channel == BLE_CHANNEL_TELEMETRY && ++s_tearCount % (FW_INJECT_BLE_TEAR) == 0) tear = true;
+#endif
   for (size_t offset = 0; offset < total;) {
     if (!bleGattSecure() || bleGattGeneration() != generation) return false;  // link gone: nothing to resync
     size_t chunk = bleGattChunkSize();
     if (chunk > total - offset) chunk = total - offset;
     int tries = 0;
-    while (!bleGattNotify(channel, &s_frame[offset], chunk)) {
+    while ((tear && offset > 0) || !bleGattNotify(channel, &s_frame[offset], chunk)) {
       if (offset == 0 && channel == BLE_CHANNEL_TELEMETRY) return false;
       if (!bleGattSecure() || bleGattGeneration() != generation) return false;
       if (++tries >= BLE_NOTIFY_RETRIES) {
