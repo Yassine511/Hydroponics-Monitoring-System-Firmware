@@ -427,9 +427,7 @@ The task is "WifiMqtt" (core 0, priority 2, 6 KB stack) in `src/transports/wifi_
 - The LAN link is plaintext. It carries read-only data, and the token only keeps casual clients out (contract v2).
 - The PHY calibration data stored by the Wi-Fi driver in NVS (namespace `phy`, written by the IDF at first start) is a second framework writer besides the NimBLE bond store. Like the bond store, those writes do not take the flash gate.
 
-**Bench tool.** `tools/lan_bench.py APP_DIR checks|stream N` runs over the app's own `BleLink` and `LanLink`. The PC must be bonded, the ESP must be on Wi-Fi, and the app must not be connected over Bluetooth at the same time.
-- `checks` covers: wrong token, right token, a command over LAN, rotating the token, old and new token.
-- `stream N` keeps Bluetooth and LAN busy together for N seconds (radio-load test).
+**Bench tool.** `tools/lan_bench.py` was removed with the LAN link (28 Oct 2026); the results below are its 27–28 Oct run. `tools/ble_bench.py stream N` keeps the Bluetooth link busy for radio-load tests.
 
 **Hardware run (27–28 Oct 2026):**
 
@@ -523,7 +521,7 @@ The task is "BleTransport" (core 0, priority 2, 6 KB stack), in `src/transports/
 
 **Bench tools** (in `tools/`, use PlatformIO's Python for `serial_log.py` and the app's venv for `ble_bench.py`):
 - `serial_log.py PORT FILE SECONDS [--reset]`: logs the port without the monitor's DTR/RTS toggling. `--reset` gives exactly one controlled boot.
-- `ble_bench.py APP_DIR before|after|stream N`: runs the configuration bench before and after a reboot, or keeps a busy link for N seconds.
+- `ble_bench.py APP_DIR before|after|stream N`: runs the configuration bench before and after a reboot (sensor switch, Wi-Fi credentials, latch reset, persistence), or keeps a busy link for N seconds. The LAN token steps were dropped with the LAN link.
 
 ## Configuration and NVS (WP8 Stage 8.2)
 
@@ -598,13 +596,17 @@ bring-up harness prints those values with `(uncal)`.
 pio run -e test_ph -t upload -t monitor
 ```
 
+Each reading is followed by a `module NNNN mV` line: the module PO voltage
+used for the fit, printed whatever the pH line shows (the nominal fit is the
+default, see below).
+
 1. **Offset (once per module).** Unplug the probe and short the BNC centre to
-   its shell. Turn the pot nearest the BNC until the line reads about
-   `2500 mV (uncal)`, which is pH 7. A factory-set module puts pH 7 near 0 V,
+   its shell. Turn the pot nearest the BNC until the module line reads about
+   `2500 mV`, which is pH 7. A factory-set module puts pH 7 near 0 V,
    so it first prints `ph=UNPOWERED` (PO below about 170 mV). Check that the
    5 V rail is on, then keep turning the pot until mV values appear.
 2. **Buffers.** Plug the probe in. Rinse it, put it in the pH 6.86 buffer, wait
-   at least 2 minutes and note the mV. Rinse it again, then do the same with
+   at least 2 minutes and note the module mV. Rinse it again, then do the same with
    pH 4.01. Never move the probe between solutions without rinsing.
 3. **Fit.** Enter both mV values as `PH_BUFFER_A_MV` and `PH_BUFFER_B_MV` in
    `test/bringup/ph_main.c` and flash it again. The slope is printed at boot.

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "domain/protocol_codec.h"
+#include "domain/sensor_set.h"
 #include "hal/clock.h"
 #include "policy_config.h"
 #include "services/acquisition.h"
@@ -64,6 +65,8 @@ size_t transportEncodeState(TransportScratch* s, const char* link, char* buf, si
 
 size_t transportEncodeTelemetry(TransportScratch* s, char* buf, size_t cap) {
   if (!snapshotPeek(&s->snap)) return 0;
+  const RailState rail = railStateRead();
+  snapshotGateRail(&s->snap, rail.valid5v, rail.epoch);  // the rail may have failed since acquisition
   configurationPeekApplied(&s->cfg);
   return protocolEncodeTelemetry(&s->snap, monoNowMs(), transportBootId(), s->cfg.revision, s->cfg.sensorEnabled,
                                  buf, cap);

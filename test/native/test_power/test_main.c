@@ -190,6 +190,59 @@ static void test_kill_switch_only_reports_the_level(void) {
   TEST_ASSERT_EQUAL_STRING("TRANSITION_TO_NORMAL", powerModeName(POWER_MODE_TRANSITION_TO_NORMAL));
 }
 
+// Audit P1: a LOW-HIGH pulse between two ticks is only visible as a new rail
+// epoch. It must restart the stability timer, and the restore names the epoch.
+static void test_unsampled_glitch_restarts_stability_from_the_new_epoch(void) {
+  begin(true, &kCfg);
+  s_in.railValid = true;
+  s_in.railEpoch = 1;
+  at(2000);
+  s_in.railValid = false;  // the ISR saw both edges; the level is HIGH again
+  s_in.railEpoch = 3;
+  at(2010);
+  TEST_ASSERT_FALSE(s_a.restoreRail);  // the old HIGH timer no longer counts
+  at(2509);
+  TEST_ASSERT_FALSE(s_a.restoreRail);
+  at(2510);
+  TEST_ASSERT_TRUE(s_a.restoreRail);
+  TEST_ASSERT_EQUAL_UINT32(3, s_a.restoreEpoch);
+}
+
+static void test_muted_isr_holds_the_rail_invalid(void) {
+  begin(true, &kCfg);
+  s_in.railValid = false;
+  s_in.edgesMissed = true;  // muted after the first edge: later edges are not counted
+  at(3000);
+  TEST_ASSERT_FALSE(s_a.restoreRail);
+  s_in.edgesMissed = false;  // re-armed
+  at(3010);
+  at(3509);
+  TEST_ASSERT_FALSE(s_a.restoreRail);
+  at(3510);
+  TEST_ASSERT_TRUE(s_a.restoreRail);
+}
+
+static void test_glitch_during_return_defers_the_rail_restore(void) {
+  begin(false, &kCfg);
+  s_in.networkOff = true;
+  at(1010);
+  s_in.externalPower = true;
+  at(2000);
+  at(2500);
+  TEST_ASSERT_EQUAL(POWER_MODE_TRANSITION_TO_NORMAL, s_f.mode);
+  s_in.railEpoch = 2;  // an unsampled glitch while quiescing
+  at(2505);
+  s_in.releasedGen = 1;
+  at(2510);
+  TEST_ASSERT_EQUAL(POWER_WORKER_NORMAL, s_a.grant);
+  TEST_ASSERT_FALSE(s_a.restoreRail);  // 5 ms of stability is not enough
+  at(3004);
+  TEST_ASSERT_FALSE(s_a.restoreRail);
+  at(3005);
+  TEST_ASSERT_TRUE(s_a.restoreRail);
+  TEST_ASSERT_EQUAL_UINT32(2, s_a.restoreEpoch);
+}
+
 int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
@@ -202,5 +255,8 @@ int main(int argc, char** argv) {
   RUN_TEST(test_wifi_not_off_in_time_reports_degraded);
   RUN_TEST(test_new_loss_during_return_aborts_it);
   RUN_TEST(test_kill_switch_only_reports_the_level);
+  RUN_TEST(test_unsampled_glitch_restarts_stability_from_the_new_epoch);
+  RUN_TEST(test_muted_isr_holds_the_rail_invalid);
+  RUN_TEST(test_glitch_during_return_defers_the_rail_restore);
   return UNITY_END();
 }

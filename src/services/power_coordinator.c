@@ -61,8 +61,14 @@ static void execute(const PowerModeActions* a) {
               (unsigned long)a->quiesceGen);
   }
   if (a->restoreRail) {
-    railStateRestore(railStateRead().epoch);
-    logPrintf(LOG_LEVEL_INFO, "power: 5 V rail valid (epoch %lu)", (unsigned long)railStateRead().epoch);
+    railStateRestore(a->restoreEpoch);  // a newer edge keeps the rail invalid
+    const RailState rail = railStateRead();
+    if (rail.valid5v) {
+      logPrintf(LOG_LEVEL_INFO, "power: 5 V rail valid (epoch %lu)", (unsigned long)rail.epoch);
+    } else {
+      logPrintf(LOG_LEVEL_INFO, "power: 5 V restore skipped, epoch %lu -> %lu", (unsigned long)a->restoreEpoch,
+                (unsigned long)rail.epoch);
+    }
   }
   if (a->grant != POWER_WORKER_NONE) {
     const bool normal = a->grant == POWER_WORKER_NORMAL;
@@ -112,9 +118,10 @@ static void powerTask(void* arg) {
   MonoMs sinceMs = monoNowMs();
   for (;;) {
     const MonoMs now = monoNowMs();
+    const RailState rail = railStateRead();  // one coherent {valid, epoch} per tick
     const bool high = senseHigh();
-    const PowerModeInputs in = {now, high, railStateRead().valid5v, acquisitionReleasedGeneration(),
-                                wifiMqttRadioOff()};
+    const PowerModeInputs in = {now, high, rail.valid5v, acquisitionReleasedGeneration(), wifiMqttRadioOff(),
+                                rail.epoch, isr && !s_isrArmed};
     PowerModeActions a;
     powerModeStep(&s_fsm, &in, &a);
     execute(&a);

@@ -22,6 +22,7 @@ from Protocol import CALIBRATABLE, parse_calibration, parse_event, parse_state, 
 from Store import Store
 
 STATE_STALE_S = 15
+TELEMETRY_STALE_S = 10  # three 3 s frames missed
 BLE_RETRY_DELAYS = (2, 4, 8)
 GLOBAL = "*"  # Settings row owner for app-wide settings
 
@@ -51,6 +52,7 @@ class Session:
         self.node: str | None = store.setting(GLOBAL, "last_node")
         self.state: dict | None = None
         self.state_at = 0.0
+        self.telemetry_at = 0.0
         self.readings: dict[str, dict] = {}
         self.sensors: list[SensorInfo] = list(SENSORS)
         self.calibration: dict[str, dict] = {}
@@ -95,6 +97,11 @@ class Session:
     @property
     def power_mode(self) -> str:
         return (self.state or {}).get("mode", "unknown")
+
+    @property
+    def telemetry_fresh(self) -> bool:
+        """State alone keeps the link looking alive: this says data is still flowing."""
+        return self.connected and self.telemetry_at > 0 and time.monotonic() - self.telemetry_at < TELEMETRY_STALE_S
 
     def reading_age_s(self, reading: dict) -> float | None:
         if reading.get("age_ms") is None:
@@ -246,6 +253,7 @@ class Session:
         boot = message.get("boot") if isinstance(message.get("boot"), int) else self.state["boot"]
         cfg_rev = message.get("cfg_rev") if isinstance(message.get("cfg_rev"), int) else 0
         received = time.monotonic()
+        self.telemetry_at = received
         self.recorded += self.store.record_samples(self.node, boot, cfg_rev, samples, link_kind)
         for sample in samples:
             current = self.readings.get(sample["metric"])

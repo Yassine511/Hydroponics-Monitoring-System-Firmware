@@ -2,13 +2,15 @@
 // Switched 5 V rail must be ON. PO -> 10k/15k -> GPIO7 (ADC1_CH6).
 // Replaces src/main.c in this env only; links the production driver.
 //
-// Procedure (README "pH-4502C calibration"):
+// Procedure (README "pH-4502C calibration"). Every reading is followed by a
+// "module NNNN mV" line: the module PO voltage the buffer fit is made from,
+// whatever the pH line shows (nominal fit, buffer fit or none).
 //  1. Offset: probe off, BNC shorted. Turn the pot nearest the BNC until the
-//     line reads ~2500 mV (uncal) - that is the module PO voltage (pH 7).
+//     module line reads ~2500 mV - that is the module PO voltage (pH 7).
 //     A factory-set module starts near 0 V and prints "ph=UNPOWERED": check
 //     the 5 V rail, then keep turning the pot until mV values appear.
-//  2. Probe in, rinse, pH 6.86 buffer, wait >= 2 min, note the mV.
-//     Rinse, pH 4.01 buffer, wait >= 2 min, note the mV.
+//  2. Probe in, rinse, pH 6.86 buffer, wait >= 2 min, note the module mV.
+//     Rinse, pH 4.01 buffer, wait >= 2 min, note the module mV.
 //  3. Put both mV values below and re-flash: readings switch to pH / OK.
 // Without buffers: pH comes from the nominal fit below and prints "(uncal)".
 #include <Arduino.h>
@@ -18,6 +20,7 @@
 #include "board_profile.h"
 #include "bringup_harness.h"
 #include "hal/adc_channel.h"
+#include "domain/calibration.h"
 #include "drivers/ph.h"
 
 // Module mV measured in each buffer (step 2). 0 = not measured yet: uncalibrated.
@@ -37,7 +40,15 @@ static AdcChannel s_adc = ADC_CHANNEL_INIT;
 static PhConfig s_config = {&s_adc, BOARD_PH_DIVIDER_TOP_OHM, BOARD_PH_DIVIDER_BOTTOM_OHM,
                             {1.0f, 0.0f, 0, false}, false};  // set in setup()
 static PhDriver s_driver;
-static BringupContext s_ctx = {&s_driver.base, CFG_FRAME_PERIOD_MS, NULL};
+// The module mV for the procedure, from the pin mV the driver publishes as raw.
+static void printModuleMv(SensorDriver* driver) {
+  Reading r;
+  if (sensorDriverReadResult(driver, &r, 1) != 1 || !r.hasRaw) return;
+  printf("    module %.0f mV\n",
+         (double)dividerRecoverMv((float)r.raw, BOARD_PH_DIVIDER_TOP_OHM, BOARD_PH_DIVIDER_BOTTOM_OHM));
+}
+
+static BringupContext s_ctx = {&s_driver.base, CFG_FRAME_PERIOD_MS, printModuleMv};
 
 void setup(void) {
   if (PH_BUFFER_A_MV > 0.0f && PH_BUFFER_B_MV > 0.0f) {

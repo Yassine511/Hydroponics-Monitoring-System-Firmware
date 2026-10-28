@@ -2,6 +2,7 @@
 // frame reassembly, contract v2 encoders and command parser, configuration
 // blob (schema 2, calibration, v1 migration), calibration fits and capture,
 // event journal, backoff, and the Safety command / disabled-sensor rules.
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <unity.h>
@@ -334,6 +335,29 @@ static ConfigDefaults defaults(void) {
   d.tds = kTds;
   d.light = kLight;
   return d;
+}
+
+// Audit P2: a long integer must not overflow the accumulator (signed
+// overflow is undefined), in a known field or in an ignored one.
+static void test_parse_long_integers_without_overflow(void) {
+  Command c;
+  TEST_ASSERT_EQUAL(PROTOCOL_ERR_BAD_FIELD,
+                    parse("{\"v\":2,\"id\":\"a\",\"op\":\"reset_latch\","
+                          "\"data\":{\"rule\":123456789012345678901234567890}}", &c));
+  TEST_ASSERT_EQUAL(PROTOCOL_OK,
+                    parse("{\"v\":2,\"id\":\"a\",\"op\":\"reset_latch\",\"pad\":-999999999999999999999999999999,"
+                          "\"data\":{\"rule\":1}}", &c));
+  TEST_ASSERT_EQUAL_UINT8(1, c.rule);
+}
+
+// A stored fit that is not a finite number is a corrupt blob.
+static void test_blob_rejects_non_finite_fit(void) {
+  const ConfigDefaults d = defaults();
+  ConfigBlob b;
+  configBlobInit(&b, &d);
+  b.ph.slope = NAN;
+  configBlobSeal(&b);
+  TEST_ASSERT_FALSE(configBlobValid(&b));
 }
 
 static void test_blob_defaults_seal_and_corruption(void) {
@@ -710,5 +734,7 @@ int main(int argc, char** argv) {
   RUN_TEST(test_safety_reset_latch_command);
   RUN_TEST(test_safety_disabled_sensor_cannot_silence_alarm);
   RUN_TEST(test_sensor_keys_round_trip);
+  RUN_TEST(test_parse_long_integers_without_overflow);
+  RUN_TEST(test_blob_rejects_non_finite_fit);
   return UNITY_END();
 }

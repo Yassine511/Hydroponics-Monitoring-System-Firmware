@@ -19,6 +19,10 @@ typedef struct LinearCalibration {
 
 float linearApply(const LinearCalibration* c, float x);
 
+// True if slope and offset are finite numbers. Every fit maker below refuses
+// non-finite input or output; config_blob refuses a stored non-finite fit.
+bool linearCalibrationFinite(const LinearCalibration* c);
+
 // Two-point fit through (x1, y1) and (x2, y2), e.g. module mV read in two pH
 // buffers. false (and *out left invalid) if the x values are too close.
 bool linearFromTwoPoints(float x1, float y1, float x2, float y2, uint16_t revision,

@@ -1,12 +1,13 @@
 import csv
 import json
 
+from Catalog import live_health, stale_after_s
 from Export import export_meta, write_csv, write_json
 from Store import Store
 
 
-def sample(metric, seq, value, age_ms=0, health="OK"):
-    return {"metric": metric, "value": value, "unit": "ppm", "health": health, "age_ms": age_ms,
+def sample(metric, seq, value, age_ms=0, health="OK", unit="ppm"):
+    return {"metric": metric, "value": value, "unit": unit, "health": health, "age_ms": age_ms,
             "seq": seq, "quality": 0, "cal_rev": 1}
 
 
@@ -74,3 +75,38 @@ def test_settings_round_trip(tmp_path):
     store.delete_settings("N", "lan_token")
     assert store.setting("N", "lan_token", "none") == "none"
     store.close()
+
+
+def test_units_are_never_mixed_across_a_calibration(tmp_path):
+    store = Store(tmp_path)
+    store.record_samples("N", 1, 1, [sample("light_level", 1, 100.0, unit="mV", health="UNCALIBRATED")], "ble",
+                         received_ms=1_000)
+    store.record_samples("N", 1, 2, [sample("light_level", 2, 10_000.0, unit="lux")], "ble", received_ms=2_000)
+    summary = store.summary("N", ["light_level"])["light_level"]
+    assert summary["unit"] == "lux" and summary["mean"] == 10_000.0 and summary["min"] == 10_000.0
+    assert summary["other_units"] == ["mV"] and summary["excluded"] == 1
+    assert summary["count"] == 2 and summary["usable"] == 2
+    assert [v for _t, v in store.series("N", "light_level", None, None)] == [10_000.0]
+    assert [v for _t, v in store.series("N", "light_level", None, None, unit="mV")] == [100.0]
+    store.close()
+
+
+def test_fault_after_ok_is_a_new_row_when_seq_advances(tmp_path):
+    # Firmware gives every observation its own seq (failures included), so the
+    # FAULT that follows an OK sample is recorded, not dropped as a re-send.
+    store = Store(tmp_path)
+    assert store.record_samples("N", 1, 1, [sample("water_distance", 7, 120.0)], "ble", received_ms=1_000) == 1
+    assert store.record_samples("N", 1, 1, [sample("water_distance", 7, 120.0)], "ble", received_ms=4_000) == 0
+    assert store.record_samples("N", 1, 1, [sample("water_distance", 8, None, health="FAULT")], "ble",
+                                received_ms=5_000) == 1
+    summary = store.summary("N", ["water_distance"])["water_distance"]
+    assert summary["count"] == 2 and summary["usable"] == 1
+    store.close()
+
+
+def test_old_values_age_into_stale_locally():
+    assert live_health("air_temperature", "OK", 2.0) == "OK"
+    assert live_health("air_temperature", "OK", 600.0) == "STALE"  # ten minutes old: not "Live"
+    assert live_health("ph", "UNCALIBRATED", stale_after_s("ph") + 0.1) == "STALE"
+    assert live_health("ph", "FAULT", 600.0) == "FAULT"
+    assert stale_after_s("air_temperature") < stale_after_s("tds")

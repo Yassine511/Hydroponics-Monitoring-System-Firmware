@@ -22,7 +22,11 @@
 //
 // Rail validity: the ISR invalidates the rail on every sense edge (also a
 // short glitch). In NORMAL the machine restores it after returnStableMs of
-// stable power. Boot: power present -> normal worker, rail restored once
+// stable power. Stability is measured from the newest rail epoch: an edge the
+// ISR saw but this machine did not sample (a LOW-HIGH pulse between two ticks)
+// still restarts the timer, and so does a muted ISR (edges unobservable). The
+// restore names the epoch it was decided on, so a newer edge is never
+// acknowledged by mistake. Boot: power present -> normal worker, rail restored once
 // stable; power absent -> conservative low-power path.
 //
 // transitionsEnabled = false (POLICY_POWER_TRANSITIONS_ENABLED 0): the normal
@@ -61,6 +65,8 @@ typedef struct PowerModeInputs {
   bool railValid;         // rail_state validity now
   uint32_t releasedGen;   // newest generation the lease holder released (0 = none)
   bool networkOff;        // Wi-Fi acknowledged: radio off
+  uint32_t railEpoch;     // rail_state epoch, read together with railValid
+  bool edgesMissed;       // the sense ISR is muted: edges are not counted now
 } PowerModeInputs;
 
 // What PowerCoordinator must do after a step, in this order: quiesce,
@@ -69,6 +75,7 @@ typedef struct PowerModeActions {
   PowerWorker quiesce;    // NONE = nothing
   uint32_t quiesceGen;
   bool restoreRail;
+  uint32_t restoreEpoch;  // restore only if the rail is still at this epoch
   PowerWorker grant;      // NONE = nothing
   uint32_t grantGen;
   bool wifiStop;
@@ -84,6 +91,7 @@ typedef struct PowerModeFsm {
   uint32_t gen;           // generation of the current / pending lease
   bool netPending;        // waiting for Wi-Fi radio off
   bool haveLow, haveHigh;
+  uint32_t lastEpoch;     // rail epoch seen on the previous step
   MonoMs lowSinceMs, highSinceMs;
   MonoMs ackDeadlineMs, netDeadlineMs;
 } PowerModeFsm;

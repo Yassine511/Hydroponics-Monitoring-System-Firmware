@@ -160,12 +160,12 @@ static void evaluateRules(const Reading* r, MonoMs now) {
 
 // Sensors on the external, switched 5 V rail (§14): gated on the rail epoch.
 static bool onFiveVoltRail(const DriverRun* run) {
-  const SensorId s = sensorDriverId(run->driver);
-  return s == SENSOR_HCSR04 || s == SENSOR_PH || s == SENSOR_TDS;
+  return sensorMaskHas(SENSOR_MASK_RAIL_5V, sensorDriverId(run->driver));
 }
 
-// Every metric of the run's sensor shows `health` now (no new sample: the
-// sequence is unchanged and telemetry sends a null value).
+// Every metric of the run's sensor shows `health` now. No new value (telemetry
+// sends null), but a new observation: a new sequence, so the app records the
+// transition and every repeated failure (contract: one row per seq).
 static void markSensor(const DriverRun* run, Health health, MonoMs now) {
   const SensorId s = sensorDriverId(run->driver);
   for (uint8_t m = 0; m < METRIC_COUNT; ++m) {
@@ -175,6 +175,7 @@ static void markSensor(const DriverRun* run, Health health, MonoMs now) {
     r->intervalStartMs = now;
     r->intervalEndMs = now;
     r->powerEpoch = railStateRead().epoch;
+    ++r->sequence;
   }
 }
 
@@ -196,6 +197,10 @@ static void storeResults(DriverRun* run, MonoMs now, bool guardTimeout) {
       r->intervalEndMs = now;
     }
     if (railLost) r->health = HEALTH_UNPOWERED;
+    // Every stored result is a new observation, failures included: the
+    // drivers count only usable samples, which would give a FAULT after an OK
+    // the OK's sequence (and the app would drop it as a re-send).
+    r->sequence = s_work.readings[r->metric].sequence + 1u;
     r->powerEpoch = epoch;
     r->configRevision = s_appliedRevision;
     s_work.readings[r->metric] = *r;

@@ -70,6 +70,10 @@ bool bleGattSetStateValue(const uint8_t* frame, size_t len);
 int bleGattBondCount(void);
 void bleGattClearBonds(void);
 
+// Drops the current client (bonds are kept). Used when a notification frame
+// was cut after its first chunk: the client's stream is out of step.
+void bleGattDisconnect(void);
+
 void bleGattGetStats(BleGattStats* out);
 
 #ifdef __cplusplus

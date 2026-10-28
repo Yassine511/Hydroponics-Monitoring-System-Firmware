@@ -13,9 +13,14 @@
 //   4 commands            WP8: latch resets, refused when expired or while
 //                         the rule is still active (§12 step 4)
 //   5 output              relay = auto enabled AND lamp ON AND no interlock
+//                         AND every relay-interlock input available
 // Interlock: any enabled rule with action DEENERGIZE on ACTUATOR_RELAY1 that
 // is latched or active, or that tripped in this step's events (so a TRIP
 // followed by a CLEAR in the same batch still de-energises once).
+// Unavailable input (§12): an enabled relay-interlock rule whose input is in
+// staleMask cannot watch the relay, so the relay is held OFF (reason
+// INPUT_MISSING) until its data is fresh again. A rule whose sensor was
+// switched off is not monitored (staleMask), unless it is still latched.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -37,7 +42,8 @@ enum {
   LAMP_REASON_STALE,        // light result too old: forced OFF
   LAMP_REASON_INTERLOCK,    // alarm interlock: relay de-energised
   LAMP_REASON_DISABLED,     // POLICY_LAMP_AUTO_ENABLED = 0
-  LAMP_REASON_UNPOWERED     // WP9: external 5 V down, the relay coil has no supply
+  LAMP_REASON_UNPOWERED,    // WP9: external 5 V down, the relay coil has no supply
+  LAMP_REASON_INPUT_MISSING // a relay-interlock rule has no fresh input: relay held OFF
 };
 
 typedef struct SafetyConfig {

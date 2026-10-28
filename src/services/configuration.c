@@ -419,11 +419,25 @@ bool configurationInit(void) {
     gatedSetBlob("lan_tok", NULL, 0);
     logPrintf(LOG_LEVEL_INFO, "cfg: old LAN token erased");
   }
+  // SGP30 baseline (Sensirion integration guide §3.8): valid only if the
+  // sensor was off for less than 7 days. There is no wall clock, so the
+  // downtime is known only for resets where the chip kept its supply (software,
+  // panic, watchdog, reset pin: seconds). After a power-on, brown-out or
+  // unknown reset it may have been off any time: relearn, and erase the old
+  // baseline so a later warm reset cannot bring it back.
   uint16_t pair[2];
   if (getBlob("sgp_base", pair, sizeof(pair))) {
-    s_storedCo2 = pair[0];
-    s_storedTvoc = pair[1];
-    s_haveStoredBaseline = true;
+    const esp_reset_reason_t why = esp_reset_reason();
+    const bool supplyKept = why == ESP_RST_SW || why == ESP_RST_PANIC || why == ESP_RST_INT_WDT ||
+                            why == ESP_RST_TASK_WDT || why == ESP_RST_WDT || why == ESP_RST_EXT;
+    if (supplyKept) {
+      s_storedCo2 = pair[0];
+      s_storedTvoc = pair[1];
+      s_haveStoredBaseline = true;
+    } else {
+      gatedSetBlob("sgp_base", NULL, 0);
+      logPrintf(LOG_LEVEL_INFO, "cfg: SGP30 baseline dropped (reset %d: off-time unknown, relearning)", (int)why);
+    }
   }
 
   const TaskSpec* spec = cfgTaskSpec(TASK_ID_CONFIGURATION);

@@ -42,6 +42,9 @@ bool configBlobValid(const ConfigBlob* b) {
   if ((b->sensorEnabled & (SensorMask)~SENSOR_MASK_ALL) != 0) return false;
   if ((b->calOverridden & (uint8_t)~CAL_BITS_ALL) != 0) return false;
   if (!(b->lamp.onBelowMv < b->lamp.offAboveMv) || b->lamp.faultsToOff == 0) return false;
+  if (!linearCalibrationFinite(&b->ph) || !linearCalibrationFinite(&b->tds) || !linearCalibrationFinite(&b->light)) {
+    return false;
+  }
   return true;
 }
 

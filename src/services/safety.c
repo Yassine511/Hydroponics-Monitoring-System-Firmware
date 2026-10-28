@@ -12,6 +12,8 @@
 #include "diagnostics/progress.h"
 #include "hal/clock.h"
 #include "hal/relay.h"
+#include "domain/alarm_sticky.h"
+#include "domain/sensor_set.h"
 #include "policy_config.h"
 #include "services/configuration.h"
 #include "services/rail_state.h"
@@ -20,14 +22,7 @@
 _Static_assert(EVENT_JOURNAL_LEN == CFG_ALARM_JOURNAL_LEN, "journal length must match app_config.h");
 
 // ---- Sticky per-rule store (§11): survives a full detail queue -------------
-typedef struct StickySlot {
-  bool tripSinceDrain;      // a TRIP was submitted since Safety last drained
-  bool lost;                // a detail record of this rule was dropped
-  RuleDecision last;        // last decision submitted (TRIP or CLEAR)
-  AlarmEvent trip;          // worst TRIP since the last drain
-  AlarmEvent clear;         // the last CLEAR
-} StickySlot;
-
+// Protocol in domain/alarm_sticky.h; every call is under s_stickyMux.
 static portMUX_TYPE s_stickyMux = portMUX_INITIALIZER_UNLOCKED;
 static StickySlot s_sticky[POLICY_RULE_COUNT];
 static volatile uint32_t s_detailOverflow;  // single writer per increment site, read for status only
@@ -48,6 +43,8 @@ static TaskHandle_t s_task = NULL;
 // ---- WP8: command queue and event journal -----------------------------------
 typedef struct SafetyRequest {
   SafetyCommand command;
+  uint32_t session;              // transport session generation at receive time
+  uint32_t (*sessionNow)(void);  // NULL = no session check
   SafetyReplyFn reply;
   void* ctx;
 } SafetyRequest;
@@ -127,36 +124,21 @@ static void latencyRecord(const AlarmEvent* events, uint8_t n) {
 }
 #endif
 
-static bool moreExtreme(const AlarmRule* rule, float a, float b) {
-  return rule->comparison == COMPARISON_ABOVE ? a > b : a < b;
-}
-
 bool safetySubmitEvent(const AlarmEvent* e) {
   if (e == NULL || e->ruleId >= POLICY_RULE_COUNT) return false;
   if (e->decision != RULE_DECISION_TRIP && e->decision != RULE_DECISION_CLEAR) return false;
-  const AlarmRule* rule = &kPolicyRules[e->ruleId];
+  StickySlot* slot = &s_sticky[e->ruleId];
 
   portENTER_CRITICAL(&s_stickyMux);
-  StickySlot* slot = &s_sticky[e->ruleId];
-  slot->last = e->decision;
-  if (e->decision == RULE_DECISION_TRIP) {
-    if (!slot->tripSinceDrain || moreExtreme(rule, e->sample.value, slot->trip.sample.value)) {
-      slot->trip = *e;
-    }
-    slot->tripSinceDrain = true;
-  } else {
-    slot->clear = *e;
-  }
+  stickyBegin(slot, &kPolicyRules[e->ruleId], e);  // in flight: Safety leaves the slot alone
   portEXIT_CRITICAL(&s_stickyMux);
 
-  bool queued = s_detail != NULL && xQueueSend(s_detail, e, 0) == pdTRUE;
-  if (!queued) {
-    portENTER_CRITICAL(&s_stickyMux);
-    slot->lost = true;
-    ++s_detailOverflow;
-    portEXIT_CRITICAL(&s_stickyMux);
-  }
-  if (s_task != NULL) xTaskNotifyGive(s_task);
+  const bool queued = s_detail != NULL && xQueueSend(s_detail, e, 0) == pdTRUE;  // never inside the portMUX
+  portENTER_CRITICAL(&s_stickyMux);
+  stickyEnd(slot, queued);
+  if (!queued) ++s_detailOverflow;
+  portEXIT_CRITICAL(&s_stickyMux);
+  if (s_task != NULL) xTaskNotifyGive(s_task);  // after stickyEnd(): the next pass sees the outcome
   return queued;
 }
 
@@ -164,7 +146,8 @@ bool safetySubmitEvent(const AlarmEvent* e) {
 // dropped, let its sticky slot re-supply what may be missing: the TRIP (if
 // none came through the queue) and, if the rule's last decision was CLEAR,
 // that CLEAR too, so the rule cannot stay active forever. A record that was
-// queued arrives through the queue, so nothing is processed twice.
+// queued arrives through the queue, so nothing is processed twice. A slot
+// whose send is still in flight is collected on the next pass.
 static uint8_t drainEvents(void) {
   uint8_t n = 0;
   while (n < CFG_ALARM_DETAIL_QUEUE_LEN && xQueueReceive(s_detail, &s_events[n], 0) == pdTRUE) ++n;
@@ -176,22 +159,15 @@ static uint8_t drainEvents(void) {
     }
   }
   portENTER_CRITICAL(&s_stickyMux);
-  for (uint8_t r = 0; r < POLICY_RULE_COUNT; ++r) {
-    StickySlot* slot = &s_sticky[r];
-    if (slot->lost) {
-      if (slot->tripSinceDrain && !sawTrip[r]) s_events[n++] = slot->trip;
-      if (slot->last == RULE_DECISION_CLEAR) s_events[n++] = slot->clear;
-    }
-    slot->tripSinceDrain = false;
-    slot->lost = false;
-  }
+  n = (uint8_t)(n + stickyCollect(s_sticky, POLICY_RULE_COUNT, sawTrip, &s_events[n]));
   portEXIT_CRITICAL(&s_stickyMux);
   return n;
 }
 
-bool safetySubmitCommand(const SafetyCommand* command, SafetyReplyFn reply, void* ctx) {
+bool safetySubmitCommand(const SafetyCommand* command, uint32_t session, uint32_t (*sessionNow)(void),
+                         SafetyReplyFn reply, void* ctx) {
   if (s_commands == NULL || command == NULL) return false;
-  const SafetyRequest request = {*command, reply, ctx};
+  const SafetyRequest request = {*command, session, sessionNow, reply, ctx};
   if (xQueueSend(s_commands, &request, 0) != pdTRUE) return false;
   if (s_task != NULL) xTaskNotifyGive(s_task);
   return true;
@@ -223,10 +199,17 @@ static void journal(uint8_t ruleId, JournalKind kind, MonoMs atMs, float value) 
   portEXIT_CRITICAL(&s_journalMux);
 }
 
+// A request from a link that has since closed (or reconnected) is dropped
+// unapplied and unanswered, as Configuration does (§11).
 static uint8_t drainCommands(void) {
   uint8_t n = 0;
   while (n < SAFETY_MAX_COMMANDS && xQueueReceive(s_commands, &s_requests[n], 0) == pdTRUE) {
-    s_cmds[n] = s_requests[n].command;
+    const SafetyRequest* r = &s_requests[n];
+    if (r->sessionNow != NULL && r->sessionNow() != r->session) {
+      logPrintf(LOG_LEVEL_INFO, "safety: rule %u reset from a closed session dropped", (unsigned)r->command.ruleId);
+      continue;
+    }
+    s_cmds[n] = r->command;
     ++n;
   }
   return n;
@@ -256,10 +239,12 @@ static void safetyTask(void* arg) {
     const uint8_t n = drainEvents();
     const uint8_t nCmd = drainCommands();
     const bool haveSnap = snapshotPeek(&s_snap);
+    const RailState rail = railStateRead();
+    if (haveSnap) snapshotGateRail(&s_snap, rail.valid5v, rail.epoch);  // no 5 V value of an older epoch
     configurationPeekApplied(&s_cfg);  // defaults (all on) if Configuration is not running
     const SensorMask disabled = (SensorMask)(SENSOR_MASK_ALL & (SensorMask)~s_cfg.sensorEnabled);
     const SafetyInputs in = {haveSnap ? &s_snap : NULL, s_events, n, now, s_cmds, nCmd, disabled,
-                             !railStateRead().valid5v};
+                             !rail.valid5v};
     safetyCoreStep(&s_core, &in, &out);
 
     const bool relayChanged = out.relayOn != relayOn;

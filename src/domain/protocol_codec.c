@@ -533,8 +533,12 @@ static bool parseNumber(Parser* ps, Field* f) {
     ++p;
   } else {
     while (p < ps->end && isDigit(*p)) {
-      value = value * 10 + (*p - '0');
-      if (value > 2147483648LL) overflow = true;
+      // Past the supported range: stop accumulating (no signed overflow on a
+      // long number), keep validating the digits.
+      if (!overflow) {
+        value = value * 10 + (*p - '0');
+        if (value > 2147483648LL) overflow = true;
+      }
       ++p;
     }
   }

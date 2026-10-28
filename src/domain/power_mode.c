@@ -18,9 +18,12 @@ void powerModeInit(PowerModeFsm* f, const PowerModeConfig* cfg) {
 }
 
 static void track(PowerModeFsm* f, const PowerModeInputs* in) {
+  // A new epoch is an edge, even one this machine never sampled LOW.
+  if (in->railEpoch != f->lastEpoch || in->edgesMissed) f->haveHigh = false;
+  f->lastEpoch = in->railEpoch;
   if (in->externalPower) {
     f->haveLow = false;
-    if (!f->haveHigh) {
+    if (!f->haveHigh && !in->edgesMissed) {  // stability counts from the first watched tick
       f->haveHigh = true;
       f->highSinceMs = in->now;
     }
@@ -39,6 +42,11 @@ static bool powerLost(const PowerModeFsm* f, MonoMs now) {
 
 static bool powerStable(const PowerModeFsm* f, MonoMs now) {
   return f->haveHigh && now - f->highSinceMs >= f->cfg.returnStableMs;
+}
+
+static void restore(const PowerModeInputs* in, PowerModeActions* out) {
+  out->restoreRail = true;
+  out->restoreEpoch = in->railEpoch;
 }
 
 static void grant(PowerModeFsm* f, PowerWorker w, PowerModeActions* out) {
@@ -78,7 +86,7 @@ static void settleLow(PowerModeFsm* f, const PowerModeInputs* in) {
 static void stepBoot(PowerModeFsm* f, const PowerModeInputs* in, PowerModeActions* out) {
   if (!f->cfg.transitionsEnabled) {
     grant(f, POWER_WORKER_NORMAL, out);
-    out->restoreRail = !in->railValid;
+    if (!in->railValid) restore(in, out);
     f->mode = in->externalPower ? POWER_MODE_NORMAL : POWER_MODE_LOW_POWER;
     f->phase = PHASE_REPORT;
     return;
@@ -96,7 +104,7 @@ static void stepBoot(PowerModeFsm* f, const PowerModeInputs* in, PowerModeAction
 }
 
 static void stepReport(PowerModeFsm* f, const PowerModeInputs* in, PowerModeActions* out) {
-  out->restoreRail = !in->railValid;  // no ISR in this mode; keep 5 V sensing on
+  if (!in->railValid) restore(in, out);  // no ISR in this mode; keep 5 V sensing on
   if (powerLost(f, in->now)) {
     f->mode = POWER_MODE_LOW_POWER;
   } else if (in->externalPower) {
@@ -110,7 +118,7 @@ static void stepSteady(PowerModeFsm* f, const PowerModeInputs* in, PowerModeActi
       enterLowPath(f, in->now, out);
       startQuiesce(f, POWER_WORKER_LOW, in->now, out);
     } else if (!in->railValid && powerStable(f, in->now)) {
-      out->restoreRail = true;  // a glitch the ISR saw, now stable again
+      restore(in, out);  // a glitch the ISR saw, now stable again
     }
     return;
   }
@@ -133,7 +141,9 @@ static void stepQuiescing(PowerModeFsm* f, const PowerModeInputs* in, PowerModeA
   }
   f->owner = POWER_WORKER_NONE;
   if (f->target == POWER_WORKER_NORMAL) {
-    out->restoreRail = true;
+    // A glitch during the hand-over restarted the timer: stepSteady restores
+    // the rail once power has been stable again.
+    if (powerStable(f, in->now)) restore(in, out);
     grant(f, POWER_WORKER_NORMAL, out);
     out->wifiStart = true;
     f->netPending = false;

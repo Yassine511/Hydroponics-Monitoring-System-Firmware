@@ -31,6 +31,7 @@ void* bleTransportTaskHandle(void) { return 0; }
 #include "policy_config.h"
 #include "services/acquisition.h"
 #include "services/configuration.h"
+#include "services/rail_state.h"
 #include "services/safety.h"
 #include "services/snapshot_store.h"
 #include "transports/ble_gatt.h"
@@ -100,6 +101,9 @@ static StaticQueue_t s_resultControl;
 static uint8_t s_resultStorage[BLE_PENDING * sizeof(BleResult)];
 static QueueHandle_t s_results;
 static JournalCursor s_journalCursor;
+static bool s_eventPending;    // an event failed to send and waits at the cursor
+static bool s_eventLost;       // ... and its link closed: the next event reports gap:true
+static uint32_t s_tornGeneration = UINT32_MAX;  // link whose stream was cut mid-frame
 
 // NimBLE host task: copy and return (ble_gatt.h threading rule).
 static void onRx(const uint8_t* data, size_t len, uint32_t generation, void* ctx) {
@@ -139,20 +143,35 @@ static void onSafetyResult(uint32_t tag, SafetyCommandOutcome outcome, void* ctx
 static uint32_t sessionNow(void) { return bleGattGeneration(); }
 
 // ---- Sending ---------------------------------------------------------------------------
-// Header + payload already in s_frame. Sent in MTU-sized chunks; abandoned if
-// the session changes or NimBLE buffers stay full.
+// Header + payload already in s_frame. Sent in MTU-sized chunks. A frame not
+// started yet may be dropped (telemetry does not wait: the next frame
+// replaces it). Once its first chunk is out, the frame must finish: the
+// client reads each characteristic as one length-prefixed stream, so a cut
+// frame would turn the next one into its continuation. If NimBLE buffers stay
+// full mid-frame, the link is dropped instead (the app clears its decoders on
+// reconnect) and nothing more is sent on it.
 static bool sendFrame(BleChannel channel, size_t payloadLen, uint32_t generation) {
   if (payloadLen == 0 || !frameWriteHeader(s_frame, payloadLen)) return false;
+  if (generation == s_tornGeneration) return false;  // being dropped
   const MonoMs start = monoNowMs();
   const size_t total = FRAME_HEADER_BYTES + payloadLen;
   for (size_t offset = 0; offset < total;) {
-    if (!bleGattSecure() || bleGattGeneration() != generation) return false;
+    if (!bleGattSecure() || bleGattGeneration() != generation) return false;  // link gone: nothing to resync
     size_t chunk = bleGattChunkSize();
     if (chunk > total - offset) chunk = total - offset;
     int tries = 0;
     while (!bleGattNotify(channel, &s_frame[offset], chunk)) {
-      // Superseded data does not wait: the next telemetry frame replaces it.
-      if (channel == BLE_CHANNEL_TELEMETRY || ++tries >= BLE_NOTIFY_RETRIES || !bleGattSecure()) return false;
+      if (offset == 0 && channel == BLE_CHANNEL_TELEMETRY) return false;
+      if (!bleGattSecure() || bleGattGeneration() != generation) return false;
+      if (++tries >= BLE_NOTIFY_RETRIES) {
+        if (offset > 0) {
+          s_tornGeneration = generation;
+          bleGattDisconnect();
+          logPrintf(LOG_LEVEL_WARN, "ble: frame cut after %u of %u bytes - link dropped to resync",
+                    (unsigned)offset, (unsigned)total);
+        }
+        return false;
+      }
       vTaskDelay(pdMS_TO_TICKS(5));
     }
     offset += chunk;
@@ -220,6 +239,8 @@ static void handleCapture(const Command* cmd, uint32_t generation) {
     sendError(cmd->id, PROTOCOL_ERR_STALE, generation);
     return;
   }
+  const RailState rail = railStateRead();
+  snapshotGateRail(&s_scratch.snap, rail.valid5v, rail.epoch);  // never capture from a failed rail
   const CaptureLimits limits = {POLICY_CAL_CAPTURE_MAX_AGE_MS, CFG_STALE_ORDINARY_MS, BOARD_PH_DIVIDER_TOP_OHM,
                                 BOARD_PH_DIVIDER_BOTTOM_OHM};
   float x;
@@ -274,7 +295,7 @@ static void handleCommand(size_t len, uint32_t generation) {
   bool queued;
   if (cmd.op == CMD_OP_RESET_LATCH) {
     const SafetyCommand sc = {SAFETY_CMD_RESET_LATCH, cmd.rule, expires, tagOf(slot)};
-    queued = safetySubmitCommand(&sc, onSafetyResult, NULL);
+    queued = safetySubmitCommand(&sc, generation, sessionNow, onSafetyResult, NULL);  // dropped if the link closes
   } else {
     memset(&s_req, 0, sizeof(s_req));
     s_req.tag = tagOf(slot);
@@ -377,14 +398,24 @@ static void expirePending(uint32_t generation, MonoMs now) {
   }
 }
 
+// Peek, send, then commit: an event that could not be sent stays at the
+// cursor and is retried on the next wake (the journal reports a gap if it
+// overruns meanwhile). If the link closes first, the next session starts at
+// the journal head, so its first event reports gap:true.
 static void sendEvents(uint32_t generation) {
   JournalEvent e;
   bool gap;
-  while (safetyJournalNext(&s_journalCursor, &e, &gap)) {
-    if (!sendFrame(BLE_CHANNEL_RESULT, transportEncodeEvent(&e, gap, payload(), FRAME_MAX_PAYLOAD), generation)) {
+  JournalCursor next = s_journalCursor;
+  while (safetyJournalNext(&next, &e, &gap)) {
+    const size_t len = transportEncodeEvent(&e, gap || s_eventLost, payload(), FRAME_MAX_PAYLOAD);
+    if (!sendFrame(BLE_CHANNEL_RESULT, len, generation)) {
       STATS_ADD(resultsDropped, 1);
-      break;  // the cursor reports a gap if the journal overruns meanwhile
+      s_eventPending = true;
+      break;
     }
+    s_journalCursor = next;
+    s_eventPending = false;
+    s_eventLost = false;
   }
 }
 
@@ -419,6 +450,8 @@ static void bleTask(void* arg) {
       generation = bleGattGeneration();
       frameAssemblerReset(&s_assembler);
       xStreamBufferReset(s_rx);
+      if (s_eventPending) s_eventLost = true;  // never delivered: the next link is told
+      s_eventPending = false;
     }
     expirePending(generation, now);
     const bool secure = bleGattSecure();

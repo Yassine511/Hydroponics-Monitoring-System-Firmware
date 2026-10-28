@@ -50,8 +50,11 @@ TaskHandle_t safetyTaskHandle(void);
 typedef void (*SafetyReplyFn)(uint32_t tag, SafetyCommandOutcome outcome, void* ctx);
 
 // Zero wait. false = command queue full (reply "busy"). command->expiresMs
-// is checked in Safety, never applied late.
-bool safetySubmitCommand(const SafetyCommand* command, SafetyReplyFn reply, void* ctx);
+// is checked in Safety, never applied late. session is the transport's link
+// generation at receive time: if sessionNow() differs when Safety handles the
+// command, it is dropped unapplied and unanswered (NULL = no session check).
+bool safetySubmitCommand(const SafetyCommand* command, uint32_t session, uint32_t (*sessionNow)(void),
+                         SafetyReplyFn reply, void* ctx);
 
 // ---- WP8: alarm event journal (§11) -----------------------------------------
 // TRIP / CLEAR / reset events with independent reader cursors (BLE, LAN).

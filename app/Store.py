@@ -106,8 +106,11 @@ class Store:
         return self.connection.execute("SELECT COUNT(*) FROM Samples WHERE Node = ?", (node,)).fetchone()[0]
 
     @staticmethod
-    def _where(node, metrics, since_ms, until_ms, healthy_only):
+    def _where(node, metrics, since_ms, until_ms, healthy_only, unit=None):
         clauses, args = ["Node = ?"], [node]
+        if unit is not None:
+            clauses.append("Unit = ?")
+            args.append(unit)
         if metrics:
             clauses.append(f"Metric IN ({','.join('?' * len(metrics))})")
             args.extend(metrics)
@@ -121,28 +124,57 @@ class Store:
             clauses.append("Value IS NOT NULL")
         return " AND ".join(clauses), args
 
+    def latest_unit(self, node: str, metric: str, since_ms: int | None = None,
+                    until_ms: int | None = None) -> str | None:
+        """Unit of the newest usable sample in the window (a calibration can change it, e.g. mV -> lux)."""
+        where, args = self._where(node, [metric], since_ms, until_ms, True)
+        row = self.connection.execute(
+            f"SELECT Unit FROM Samples WHERE {where} ORDER BY SampleMs DESC LIMIT 1", args).fetchone()
+        return row[0] if row else None
+
     def summary(self, node: str, metrics: list[str] | None = None, since_ms: int | None = None,
                 until_ms: int | None = None) -> dict[str, dict]:
-        """Per metric: count, usable count, min, max, mean and the latest usable value."""
+        """Per metric: count, usable count, then min, max, mean and the latest usable value.
+
+        Values in different units are never mixed: min / max / mean / latest
+        use only the metric's latest unit; "other_units" lists the units of
+        the samples left out (recorded before a calibration changed it), and
+        "excluded" counts those usable samples.
+        """
         where, args = self._where(node, metrics, since_ms, until_ms, False)
         out = {}
-        for metric, count, usable, low, high, mean, unit in self.connection.execute(
-                f"SELECT Metric, COUNT(*), COUNT(Value), MIN(Value), MAX(Value), AVG(Value), MAX(Unit) "
-                f"FROM Samples WHERE {where} GROUP BY Metric", args):
-            out[metric] = {"count": count, "usable": usable, "min": low, "max": high, "mean": mean, "unit": unit,
-                           "latest": None, "latest_ms": None}
-        for metric in out:
-            row = self.connection.execute(
-                f"SELECT Value, SampleMs, Unit FROM Samples WHERE {where} AND Metric = ? AND Value IS NOT NULL "
-                f"ORDER BY SampleMs DESC LIMIT 1", [*args, metric]).fetchone()
-            if row:
-                out[metric]["latest"], out[metric]["latest_ms"], out[metric]["unit"] = row
+        for metric, count, usable in self.connection.execute(
+                f"SELECT Metric, COUNT(*), COUNT(Value) FROM Samples WHERE {where} GROUP BY Metric", args):
+            out[metric] = {"count": count, "usable": usable, "min": None, "max": None, "mean": None,
+                           "unit": None, "latest": None, "latest_ms": None, "other_units": [], "excluded": 0}
+        for metric, item in out.items():
+            unit = self.latest_unit(node, metric, since_ms, until_ms)
+            if unit is None:
+                row = self.connection.execute(
+                    f"SELECT Unit FROM Samples WHERE {where} AND Metric = ? ORDER BY SampleMs DESC LIMIT 1",
+                    [*args, metric]).fetchone()
+                item["unit"] = row[0] if row else None
+                continue
+            uwhere, uargs = self._where(node, [metric], since_ms, until_ms, True, unit)
+            item["unit"] = unit
+            item["min"], item["max"], item["mean"], used = self.connection.execute(
+                f"SELECT MIN(Value), MAX(Value), AVG(Value), COUNT(*) FROM Samples WHERE {uwhere}", uargs).fetchone()
+            item["excluded"] = item["usable"] - used
+            item["latest"], item["latest_ms"] = self.connection.execute(
+                f"SELECT Value, SampleMs FROM Samples WHERE {uwhere} ORDER BY SampleMs DESC LIMIT 1",
+                uargs).fetchone()
+            item["other_units"] = [row[0] for row in self.connection.execute(
+                f"SELECT DISTINCT Unit FROM Samples WHERE {where} AND Metric = ? AND Value IS NOT NULL AND Unit != ? "
+                f"ORDER BY Unit", [*args, metric, unit])]
         return out
 
     def series(self, node: str, metric: str, since_ms: int | None, until_ms: int | None,
-               max_points: int = 500) -> list[tuple[int, float]]:
-        """(time, mean value) pairs, bucketed so there are at most max_points."""
-        where, args = self._where(node, [metric], since_ms, until_ms, True)
+               max_points: int = 500, unit: str | None = None) -> list[tuple[int, float]]:
+        """(time, mean value) pairs in one unit (default: the latest), bucketed to at most max_points."""
+        unit = unit or self.latest_unit(node, metric, since_ms, until_ms)
+        if unit is None:
+            return []
+        where, args = self._where(node, [metric], since_ms, until_ms, True, unit)
         first, last = self.connection.execute(
             f"SELECT MIN(SampleMs), MAX(SampleMs) FROM Samples WHERE {where}", args).fetchone()
         if first is None:

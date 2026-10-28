@@ -200,6 +200,12 @@ extern "C" void bleGattClearBonds(void) {
   NimBLEDevice::deleteAllBonds();
 }
 
+extern "C" void bleGattDisconnect(void) {
+  if (s_server == nullptr) return;
+  const uint16_t conn = s_conn.load();
+  if (conn != BLE_HS_CONN_HANDLE_NONE) s_server->disconnect(conn);
+}
+
 extern "C" void bleGattGetStats(BleGattStats* out) {
   portENTER_CRITICAL(&s_statsMux);
   *out = s_stats;

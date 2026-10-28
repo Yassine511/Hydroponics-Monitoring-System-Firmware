@@ -66,6 +66,28 @@ HEALTH_LABELS = {
 }
 
 
+# Firmware freshness limits (alarmStaleLimitMs: BME280 1 s, others 3 s). The
+# app sees a value once per 3 s telemetry frame, so it allows that period
+# and some link slack before it shows a retained value as stale.
+FIRMWARE_STALE_MS = {"air_temperature": 1000, "air_humidity": 1000, "air_pressure": 1000}
+FIRMWARE_STALE_DEFAULT_MS = 3000
+TELEMETRY_PERIOD_S = 3.0
+TELEMETRY_SLACK_S = 4.0
+USABLE_HEALTH = ("OK", "UNCALIBRATED")
+
+
+def stale_after_s(key: str) -> float:
+    """Age beyond which the app no longer shows a metric's last value as current."""
+    return FIRMWARE_STALE_MS.get(key, FIRMWARE_STALE_DEFAULT_MS) / 1000 + TELEMETRY_PERIOD_S + TELEMETRY_SLACK_S
+
+
+def live_health(key: str, health: str, age_s: float | None) -> str:
+    """The reported health, aged locally: a usable value that has stopped arriving is STALE."""
+    if health in USABLE_HEALTH and (age_s is None or age_s > stale_after_s(key)):
+        return "STALE"
+    return health
+
+
 def metric_label(key: str) -> str:
     info = BY_METRIC.get(key)
     return info.label if info else key.replace("_", " ").capitalize()

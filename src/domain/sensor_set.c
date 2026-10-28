@@ -36,6 +36,15 @@ SensorId sensorFromKey(const char* key, size_t len) {
   return SENSOR_COUNT;
 }
 
+void snapshotGateRail(Snapshot* s, bool railValid, uint32_t railEpoch) {
+  for (uint8_t m = 0; m < METRIC_COUNT; ++m) {
+    Reading* r = &s->readings[m];
+    if (!sensorMaskHas(SENSOR_MASK_RAIL_5V, sensorOfMetric((MetricId)m))) continue;
+    if (r->health == HEALTH_STARTING || r->health == HEALTH_UNPOWERED) continue;
+    if (!railValid || r->powerEpoch != railEpoch) r->health = HEALTH_UNPOWERED;
+  }
+}
+
 SensorId sensorOfMetric(MetricId m) {
   switch (m) {
     case METRIC_AIR_TEMPERATURE:

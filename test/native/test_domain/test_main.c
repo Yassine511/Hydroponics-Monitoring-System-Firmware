@@ -4,13 +4,17 @@
 
 #include "app_config.h"
 #include "board_profile.h"
+#include <math.h>
+
 #include "domain/alarm.h"
+#include "domain/alarm_sticky.h"
 #include "domain/calibration.h"
 #include "domain/ds18b20_codec.h"
 #include "domain/lamp_control.h"
 #include "domain/reading.h"
 #include "domain/safety_core.h"
 #include "domain/schedule.h"
+#include "domain/sensor_set.h"
 #include "domain/sgp30_codec.h"
 #include "domain/tds_codec.h"
 #include "domain/ultrasonic.h"
@@ -458,13 +462,15 @@ static SafetyOutputs step(SafetyCore* c, const Snapshot* s, MonoMs now, const Al
   return out;
 }
 
-// Dark from t=1 s, one light result per second; returns the core at t=31 s
-// with the lamp ON (boot dwell 30 s).
+// Dark from t=1 s, one light result and one 25 degC air temperature per
+// second (the rules' input stays fresh); returns the core at t=31 s with the
+// lamp ON (boot dwell 30 s).
 static void lampOnAt31s(SafetyCore* c, Snapshot* s, const AlarmRule* rules, uint8_t n) {
   safetyCoreInit(c, &kSafetyTest, rules, n, 0);
   snapshotReset(s);
   for (MonoMs t = 1000; t <= 31000; t += 1000) {
     setLight(s, 10.0f, HEALTH_UNCALIBRATED, t);
+    s->readings[METRIC_AIR_TEMPERATURE] = airTemp(25.0f, t);
     step(c, s, t, NULL, 0);
   }
 }
@@ -576,9 +582,97 @@ static void test_safety_latched_interlock_beats_lamp_until_reset(void) {
 
   TEST_ASSERT_TRUE(safetyCoreResetLatch(&c, 0));
   setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 41000);
+  s.readings[METRIC_AIR_TEMPERATURE] = airTemp(36.0f, 41000);
   TEST_ASSERT_FALSE(step(&c, &s, 41000, NULL, 0).relayOn);  // OFF dwell from the interlock
   setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 61300);
+  s.readings[METRIC_AIR_TEMPERATURE] = airTemp(36.0f, 61300);
   TEST_ASSERT_TRUE(step(&c, &s, 61300, NULL, 0).relayOn);
+}
+
+// Audit P2: an enabled relay-interlock rule without fresh input cannot see a
+// fault, so the relay is held OFF (not an interlock: nothing tripped).
+static void test_safety_missing_interlock_input_holds_relay_off(void) {
+  SafetyCore c;
+  Snapshot s;
+  lampOnAt31s(&c, &s, &kHotRule, 1);
+  SafetyOutputs o = step(&c, &s, 31000, NULL, 0);
+  TEST_ASSERT_TRUE(o.relayOn);
+  setLight(&s, 10.0f, HEALTH_UNCALIBRATED, 32000);
+  o = step(&c, &s, 32100, NULL, 0);  // temperature 1.1 s old, light fresh and dark
+  TEST_ASSERT_EQUAL_HEX16(0x0001, o.staleMask);
+  TEST_ASSERT_FALSE(o.interlock);
+  TEST_ASSERT_FALSE(o.relayOn);
+  TEST_ASSERT_EQUAL_UINT8(LAMP_REASON_INPUT_MISSING, o.lampReason);
+  TEST_ASSERT_EQUAL_STRING("input missing", lampReasonName(o.lampReason));
+}
+
+static AlarmEvent stickyTrip(float v) {
+  AlarmEvent e;
+  memset(&e, 0, sizeof(e));
+  e.ruleId = 0;
+  e.decision = RULE_DECISION_TRIP;
+  e.sample = airTemp(v, 1000);
+  return e;
+}
+
+// Audit P1: the send fails, Safety drains before the "lost" mark: the TRIP
+// must still come out of the sticky slot on the next pass.
+static void test_sticky_trip_survives_drain_during_failed_send(void) {
+  StickySlot slot;
+  memset(&slot, 0, sizeof(slot));
+  const bool sawTrip[1] = {false};
+  AlarmEvent out[2];
+  const AlarmEvent trip = stickyTrip(45.0f);
+  stickyBegin(&slot, &kHotRule, &trip);
+  TEST_ASSERT_EQUAL_UINT8(0, stickyCollect(&slot, 1, sawTrip, out));  // in flight: untouched
+  stickyEnd(&slot, false);
+  TEST_ASSERT_EQUAL_UINT8(1, stickyCollect(&slot, 1, sawTrip, out));
+  TEST_ASSERT_EQUAL_UINT8(RULE_DECISION_TRIP, out[0].decision);
+  TEST_ASSERT_FLOAT_WITHIN(1e-6f, 45.0f, out[0].sample.value);
+  TEST_ASSERT_EQUAL_UINT8(0, stickyCollect(&slot, 1, sawTrip, out));  // delivered once
+}
+
+static void test_sticky_queued_record_is_not_duplicated(void) {
+  StickySlot slot;
+  memset(&slot, 0, sizeof(slot));
+  AlarmEvent out[2];
+  const AlarmEvent trip = stickyTrip(41.0f);
+  stickyBegin(&slot, &kHotRule, &trip);
+  stickyEnd(&slot, true);
+  const bool sawTrip[1] = {true};
+  TEST_ASSERT_EQUAL_UINT8(0, stickyCollect(&slot, 1, sawTrip, out));
+  TEST_ASSERT_FALSE(slot.tripSinceDrain);
+}
+
+// Audit P2: consumers re-check 5 V readings against the live rail epoch.
+static void test_snapshot_gate_rail_marks_old_epoch_unpowered(void) {
+  Snapshot s;
+  snapshotReset(&s);
+  s.readings[METRIC_PH].health = HEALTH_UNCALIBRATED;
+  s.readings[METRIC_PH].powerEpoch = 4;
+  s.readings[METRIC_TDS].health = HEALTH_OK;
+  s.readings[METRIC_TDS].powerEpoch = 5;
+  s.readings[METRIC_AIR_TEMPERATURE].health = HEALTH_OK;  // 3.3 V: never gated
+  s.readings[METRIC_AIR_TEMPERATURE].powerEpoch = 1;
+  snapshotGateRail(&s, true, 5);
+  TEST_ASSERT_EQUAL_UINT8(HEALTH_UNPOWERED, s.readings[METRIC_PH].health);
+  TEST_ASSERT_EQUAL_UINT8(HEALTH_OK, s.readings[METRIC_TDS].health);
+  TEST_ASSERT_EQUAL_UINT8(HEALTH_OK, s.readings[METRIC_AIR_TEMPERATURE].health);
+  TEST_ASSERT_EQUAL_UINT8(HEALTH_STARTING, s.readings[METRIC_WATER_DISTANCE].health);
+  snapshotGateRail(&s, false, 5);  // same epoch, rail invalid now
+  TEST_ASSERT_EQUAL_UINT8(HEALTH_UNPOWERED, s.readings[METRIC_TDS].health);
+}
+
+static void test_fits_reject_non_finite_values(void) {
+  LinearCalibration c;
+  TEST_ASSERT_FALSE(linearFromTwoPoints(NAN, 7.0f, 2000.0f, 4.0f, 1, &c));
+  TEST_ASSERT_FALSE(c.valid);
+  TEST_ASSERT_FALSE(linearFromTwoPoints(1000.0f, INFINITY, 2000.0f, 4.0f, 1, &c));
+  TEST_ASSERT_FALSE(linearGainFromPoint(INFINITY, 1.0f, 0.0f, 1e30f, 1, &c));
+  TEST_ASSERT_FALSE(phFitFromBuffers(NAN, 6.86f, 2000.0f, 4.01f, 0.001f, 0.02f, 1, &c));
+  c.slope = NAN;
+  c.offset = 0.0f;
+  TEST_ASSERT_FALSE(linearCalibrationFinite(&c));
 }
 
 static void test_safety_trip_and_clear_in_one_batch_still_deenergises(void) {
@@ -678,5 +772,10 @@ int main(int argc, char** argv) {
   RUN_TEST(test_safety_trip_and_clear_in_one_batch_still_deenergises);
   RUN_TEST(test_safety_disabled_rule_and_auto_switch);
   RUN_TEST(test_safety_reports_stale_rule_inputs);
+  RUN_TEST(test_safety_missing_interlock_input_holds_relay_off);
+  RUN_TEST(test_sticky_trip_survives_drain_during_failed_send);
+  RUN_TEST(test_sticky_queued_record_is_not_duplicated);
+  RUN_TEST(test_snapshot_gate_rail_marks_old_epoch_unpowered);
+  RUN_TEST(test_fits_reject_non_finite_values);
   return UNITY_END();
 }

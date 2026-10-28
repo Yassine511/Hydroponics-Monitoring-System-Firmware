@@ -1,5 +1,7 @@
 #include "drivers/ph.h"
 
+#include <math.h>
+
 static const float kPhMin = 0.0f, kPhMax = 14.0f;
 
 static inline PhDriver* asPh(SensorDriver* d) { return (PhDriver*)d; }
@@ -113,6 +115,10 @@ static PollResult finish(PhDriver* self, MonoMs now) {
   }
   const float ph = linearApply(&cfg->calibration, moduleMv);
   r->unit = UNIT_PH;
+  if (!isfinite(ph)) {  // a broken fit is a fault, never a value
+    r->health = HEALTH_FAULT;
+    return pr;
+  }
   if ((ph < kPhMin || ph > kPhMax) && !cfg->calibrationProvisional) {
     r->health = HEALTH_FAULT;
     return pr;

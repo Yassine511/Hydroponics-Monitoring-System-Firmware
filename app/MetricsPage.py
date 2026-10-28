@@ -166,6 +166,9 @@ class MetricsPage:
                     continue
                 unit = unit_label(item["unit"] or "")
                 usable = f"{100 * item['usable'] / item['count']:.0f} %" if item["count"] else "—"
+                if item["other_units"]:  # calibrated in this range: older values are in another unit
+                    older = ", ".join(unit_label(u) for u in item["other_units"])
+                    unit = f"{unit}; {item['excluded']:,} earlier {older} values not included"
 
                 def num(value, key=info.key):
                     return format_value(key, value) if value is not None else "—"
@@ -177,8 +180,9 @@ class MetricsPage:
                 ]))
             self.table.rows = rows
             self.empty.value = "" if rows else "No samples for this selection."
-            series = self.app.session.store.series(node, self.chart_metric, since, until, 500)
-            unit = unit_label(summary.get(self.chart_metric, {}).get("unit") or "")
+            chart_unit = summary.get(self.chart_metric, {}).get("unit")
+            series = self.app.session.store.series(node, self.chart_metric, since, until, 500, chart_unit)
+            unit = unit_label(chart_unit or "")
             self.chart.set_series(series, unit, f"No usable {metric_label(self.chart_metric).lower()} values "
                                                 f"in this range")
         if update:

@@ -1,5 +1,7 @@
 #include "drivers/tds.h"
 
+#include <math.h>
+
 #include "app_config.h"
 #include "domain/tds_codec.h"
 
@@ -109,6 +111,10 @@ static PollResult finish(TdsDriver* self, MonoMs now) {
 
   // READY in every case below: health carries the verdict, raw the level.
   PollResult pr = {DRIVER_READY, now};
+  if (!isfinite(ppm)) {  // a broken fit is a fault, never a value
+    r->health = HEALTH_FAULT;
+    return pr;
+  }
   if (self->saturated_ || ppm > TDS_FULL_SCALE_PPM) {
     r->qualityFlags |= kQualitySaturated;
     r->health = HEALTH_FAULT;  // above the rated 0-1000 ppm: never actionable

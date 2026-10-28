@@ -5,7 +5,7 @@ import time
 import flet as ft
 
 import Theme
-from Catalog import METRICS, format_value
+from Catalog import METRICS, format_value, live_health
 from Charts import Sparkline
 from Meter import target_for, unit_label
 from Store import now_ms
@@ -42,8 +42,12 @@ class MetricCard:
             health, value, unit = "NO_DATA", None, ""
         else:
             health, value, unit = reading["health"], reading["value"], reading["unit"]
+            # Age it here too: the last frame's value must not stay "Live" once frames stop.
+            health = live_health(self.info.key, health, age_s)
+            if health == "STALE":
+                value = None
         target = target_for(self.info.key, unit)
-        # No label for normal operation (Live / Uncalibrated): only states that need attention.
+        # No label for normal operation (Live): only states that need attention, Uncalibrated included.
         self.health.content = None if health in Theme.QUIET_HEALTH else Theme.health_chip(health)
         self.value.value = format_value(self.info.key, value)
         self.unit.value = unit_label(unit) if value is not None else ""
@@ -136,7 +140,8 @@ class DashboardPage:
         safety = state.get("safety", {})
         self.link_value.value = "Bluetooth" if s.connected else "Offline"
         if s.connected:
-            self.link_detail.value = "Commands available" if s.can_command else "State stale"
+            self.link_detail.value = ("No telemetry: readings are not updating" if not s.telemetry_fresh
+                                      else "Commands available" if s.can_command else "State stale")
         else:
             self.link_detail.value = "Reconnecting…" if s.ble_reconnecting else "Not connected"
         label, color, _icon = Theme.power_style(s.power_mode)

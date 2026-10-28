@@ -1,5 +1,7 @@
 #include "drivers/light.h"
 
+#include <math.h>
+
 #include "domain/calibration.h"
 
 static inline LightDriver* asLight(SensorDriver* d) { return (LightDriver*)d; }
@@ -95,6 +97,11 @@ static PollResult finish(LightDriver* self, MonoMs now) {
     r->value = linearApply(&self->config_.calibration, pinMv);
     if (r->value < 0.0f) r->value = 0.0f;
     r->health = HEALTH_OK;
+    if (!isfinite(r->value)) {  // a broken fit is a fault, never a value
+      r->health = HEALTH_FAULT;
+      PollResult bad = {DRIVER_READY, now};
+      return bad;
+    }
   } else {
     r->unit = UNIT_MILLIVOLT;
     r->value = pinMv;  // no divider: pin mV = module mV

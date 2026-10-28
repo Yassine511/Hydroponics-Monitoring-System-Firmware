@@ -129,25 +129,31 @@ void safetyCoreStep(SafetyCore* self, const SafetyInputs* in, SafetyOutputs* out
 
   // 5 Output.
   bool interlock = trippedNow;
+  bool inputMissing = false;
   for (uint8_t i = 0; i < self->ruleCount; ++i) {
     const SafetyRuleState* st = &self->rule[i];
     if (st->latched) out->latchedMask = (uint16_t)(out->latchedMask | (1u << i));
     if (st->active) out->activeMask = (uint16_t)(out->activeMask | (1u << i));
-    if ((st->latched || st->active) && isRelayInterlock(&self->rules[i])) interlock = true;
+    if (!isRelayInterlock(&self->rules[i])) continue;
+    if (st->latched || st->active) interlock = true;
+    if ((out->staleMask & (1u << i)) != 0) inputMissing = true;  // the rule cannot see a fault now
   }
-  if ((interlock || in->railDown) && self->lamp.on) lampControlForceOff(&self->lamp, in->now);
+  const bool hold = interlock || inputMissing || in->railDown;
+  if (hold && self->lamp.on) lampControlForceOff(&self->lamp, in->now);
 
   out->interlock = interlock;
   out->lampWantsOn = self->lamp.on;
   if (interlock) {
     reason = LAMP_REASON_INTERLOCK;
+  } else if (inputMissing) {
+    reason = LAMP_REASON_INPUT_MISSING;
   } else if (in->railDown) {
     reason = LAMP_REASON_UNPOWERED;
   } else if (!self->config.lampAutoEnabled) {
     reason = LAMP_REASON_DISABLED;
   }
   out->lampReason = reason;
-  out->relayOn = self->config.lampAutoEnabled && !interlock && !in->railDown && self->lamp.on;
+  out->relayOn = self->config.lampAutoEnabled && !hold && self->lamp.on;
 }
 
 bool safetyCoreResetLatch(SafetyCore* self, uint8_t ruleId) {
@@ -179,6 +185,7 @@ const char* lampReasonName(LampReason r) {
     case LAMP_REASON_INTERLOCK: return "interlock";
     case LAMP_REASON_DISABLED: return "disabled";
     case LAMP_REASON_UNPOWERED: return "no 5 V";
+    case LAMP_REASON_INPUT_MISSING: return "input missing";
   }
   return "?";
 }

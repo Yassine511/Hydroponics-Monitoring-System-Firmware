@@ -9,8 +9,9 @@ passkey is needed. Run with the app's virtual environment:
   $APP/.venv/Scripts/python tools/ble_bench.py $APP after
   $APP/.venv/Scripts/python tools/ble_bench.py $APP stream 90   # keep a link streaming (radio-load tests)
 
-before: switch TDS off, read the LAN token twice and rotate it, store test
-        Wi-Fi credentials, send a bad latch reset, repeat a no-op change.
+before: switch TDS off, store test Wi-Fi credentials, send a bad latch
+        reset, repeat a no-op change. (The LAN token steps went with the LAN
+        link, 28 Oct 2026.)
 after:  check that all of it survived the reboot, then restore (TDS on,
         Wi-Fi forgotten).
 """
@@ -76,16 +77,12 @@ async def before():
     await call(link, "set_sensor_enabled", {"sensor": "tds", "enabled": False})
     await asyncio.sleep(7)
     show("tds off")
-    t1 = await call(link, "get_lan_token", {})
-    t2 = await call(link, "get_lan_token", {})
-    t3 = await call(link, "rotate_lan_token", {})
-    print("token stable across gets:", bool(t1) and t1 == t2, "| rotate changed it:", bool(t3) and t3 != t1)
     await call(link, "set_wifi", {"ssid": "BenchNet", "password": "bench-pass-123"})
     await call(link, "reset_latch", {"rule": 5})  # bad rule -> error
     await call(link, "set_sensor_enabled", {"sensor": "tds", "enabled": False})  # no change -> ok
     await asyncio.sleep(3)
     show("after commands")
-    STATE_FILE.write_text(json.dumps({"cfg_rev": latest["state"]["cfg_rev"], "token": (t3 or {}).get("token")}))
+    STATE_FILE.write_text(json.dumps({"cfg_rev": latest["state"]["cfg_rev"]}))
     await link.disconnect()
 
 
@@ -94,9 +91,8 @@ async def after():
     link = await connect()
     show("after reboot")
     st = latest["state"]
-    t = await call(link, "get_lan_token", {})
     print("persisted: cfg_rev", st["cfg_rev"] == expected["cfg_rev"], "| tds still off", "tds" not in st["enabled"],
-          "| wifi ssid", st["wifi"].get("ssid") == "BenchNet", "| token", (t or {}).get("token") == expected["token"])
+          "| wifi ssid", st["wifi"].get("ssid") == "BenchNet")
     await call(link, "set_sensor_enabled", {"sensor": "tds", "enabled": True})
     await call(link, "forget_wifi", {})
     await asyncio.sleep(8)

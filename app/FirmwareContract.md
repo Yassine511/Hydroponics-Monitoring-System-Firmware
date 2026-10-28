@@ -57,7 +57,7 @@ Each message is UTF-8 JSON preceded by a two-byte little-endian payload length.
 | `mode` | Lowercase `powerModeName()` from the WP9 power coordinator: `normal` (external 5 V present), `transition_to_low`, `low_power` (external 5 V lost: Wi-Fi off, pH / TDS / HC-SR04 `UNPOWERED`, relay off; BLE and the 3.3 V sensors keep running), `transition_to_normal`, `degraded` (a transition step was not acknowledged in time; the controller keeps waiting and never runs two acquisition owners) or `unknown` (before the coordinator's first decision). With the firmware kill switch `POLICY_POWER_TRANSITIONS_ENABLED 0` it only reports `normal` / `low_power` from the sense pin. There is no battery field: nothing measures the battery. |
 | `power_epoch` | The 5 V rail epoch: it changes on every external-power edge. |
 | `wifi.state` | `unconfigured`, `connecting`, `connected` or `failed`. `ip` and `rssi` are present only when the state is `connected`. The password is never sent. |
-| `safety.*` | Mirrors `SafetyStatus`. `latched`, `active` and `stale` are lists of rule ids. `lamp_reason` is `lampReasonName()`: `no data`, `level`, `dwell`, `fault`, `stale`, `interlock`, `disabled` or `no 5 V` (low power: the relay coil has no supply). |
+| `safety.*` | Mirrors `SafetyStatus`. `latched`, `active` and `stale` are lists of rule ids. `lamp_reason` is `lampReasonName()`: `no data`, `level`, `dwell`, `fault`, `stale`, `interlock`, `disabled`, `no 5 V` (low power: the relay coil has no supply) or `input missing` (an enabled relay-interlock rule has no fresh input: the relay is held OFF until it has). |
 | `sgp30_baseline` | `none`, `learning`, `restored` or `valid`. |
 | `enabled` | Sensor keys that are currently enabled (see Sensors). |
 
@@ -78,7 +78,8 @@ The ESP sends one frame with all ten metrics, keyed by `metricName()`:
 - **`unit`** is `unitName()`. pH reads in `pH` with the compiled nominal fit (health `UNCALIBRATED`) until it is calibrated on the device (health `OK`). Light reads in `mV` (`UNCALIBRATED`) until a lux calibration, then in `lux` (`OK`). TDS is `ppm` throughout, `UNCALIBRATED` until a K-factor is stored.
 - **`cal_rev`** is the configuration revision at which the sensor was calibrated on the device, 0 for the factory default.
 - **`age_ms`** is the ESP time minus the end of the sample interval. The ESP has no wall clock, so the app computes the sample time as receive time minus `age_ms`.
-- **`seq`** is a per-metric counter that restarts at boot. The app stores each sample once, keyed on (node, boot, metric, seq). Telemetry goes out every 3 s, so stored history has about 3 s resolution, even though most sensors sample every 1 s.
+- **`seq`** is a per-metric counter that restarts at boot. It advances on every observation, failed ones included (`FAULT`, `TIMEOUT`, `UNPOWERED`, ...), so a health change after a good sample is a new row, never a re-send. The app stores each sample once, keyed on (node, boot, metric, seq). Telemetry goes out every 3 s, so stored history has about 3 s resolution, even though most sensors sample every 1 s.
+- **5 V sensors** (`hcsr04`, `ph`, `tds`): a reading measured in an older rail epoch, or sent while the rail is down, is sent as `UNPOWERED` with a `null` value, even if acquisition accepted it earlier.
 - **`q`** is a bit field of quality flags: 1 saturated, 2 uncompensated, 4 filter partial, 8 late.
 
 ## Sensors
@@ -155,4 +156,4 @@ Alarm events come from a 64-entry journal. They are sent on the Result character
 ~~~
 
 - `n` increases by one for each event.
-- `gap:true` means some older events were lost because the journal overflowed.
+- `gap:true` means some older events were lost: the journal overflowed, or an event could not be sent before the previous Bluetooth link closed. An event that fails to send on a live link stays queued and is sent again.

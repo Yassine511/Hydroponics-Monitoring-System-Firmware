@@ -36,7 +36,7 @@ HEALTH_STYLE = {
 }
 BAND_COLOR = {"Low": WARN, "Normal": GOOD, "High": BAD}
 # Health chips hidden on the Dashboard cards: normal operation needs no label.
-QUIET_HEALTH = {"OK", "UNCALIBRATED"}
+QUIET_HEALTH = {"OK"}  # UNCALIBRATED is shown: its numbers are not trustworthy units
 
 # power mode (State "mode", WP9) -> (label, colour, icon)
 POWER_STYLE = {
